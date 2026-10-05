@@ -1,0 +1,1 @@
+"""RescueMap desktop application."""

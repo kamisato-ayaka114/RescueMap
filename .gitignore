@@ -1,0 +1,27 @@
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated packages and large bundled runtimes
+build/
+dist/
+artifacts/
+*.spec
+
+# User-generated models, exports, and local project state
+exports/
+projects/
+*.ply
+*.vtp
+*.db
+*.db-shm
+*.db-wal
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
