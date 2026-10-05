@@ -518,7 +518,7 @@ class MainWindow(QMainWindow):
         box_select_button.clicked.connect(self.start_rectangle_region_selection)
         finish_box_select_button = QPushButton("完成框选，恢复旋转（Esc）")
         finish_box_select_button.clicked.connect(self.cancel_picking)
-        guide_points_button = QPushButton("选择四周参考点，圈定完整补充范围")
+        guide_points_button = QPushButton("选择周围参考点，拟合目标地表")
         guide_points_button.clicked.connect(self.start_fill_guide_selection)
         self.region_list = QListWidget()
         self.region_list.setMinimumHeight(100)

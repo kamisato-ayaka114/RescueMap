@@ -7,7 +7,6 @@ import numpy as np
 import pyvista as pv
 from scipy.interpolate import griddata
 from scipy.ndimage import binary_dilation, distance_transform_edt, label
-from scipy.spatial import Delaunay, QhullError
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import cg
 from scipy.stats import binned_statistic_2d
@@ -66,13 +65,9 @@ class TerrainGrid:
     fill_parameters: dict[int, float] = field(default_factory=dict)
     guide_points: dict[int, list[list[float]]] = field(default_factory=dict)
     automatic_height: np.ndarray = field(init=False, repr=False)
-    manual_override_labels: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.automatic_height = np.asarray(self.predicted_height, dtype=float).copy()
-        self.manual_override_labels = np.zeros_like(
-            self.region_labels, dtype=np.int32
-        )
 
     @property
     def region_count(self) -> int:
@@ -106,58 +101,17 @@ class TerrainGrid:
         return np.asarray(points, dtype=float).reshape((-1, 3))
 
     def effective_region_labels(self) -> np.ndarray:
-        """Return automatic labels with manual guide polygons overlaid."""
-        return np.where(
-            self.manual_override_labels > 0,
-            self.manual_override_labels,
-            self.region_labels,
-        )
+        """Return the regions detected by the original terrain prediction."""
+        return self.region_labels
 
     def region_mask(self, region_id: int) -> np.ndarray:
-        labels = self.effective_region_labels()
-        return ((labels == region_id) & self.prediction_mask())
+        return (self.region_labels == region_id) & self.predicted
 
     def prediction_mask(self) -> np.ndarray:
-        return self.predicted | (self.manual_override_labels > 0)
+        return self.predicted
 
     def observation_mask(self) -> np.ndarray:
-        return self.observed & (self.manual_override_labels == 0)
-
-    def _extend_region_to_guide_polygon(self, region_id: int) -> bool:
-        """Uniformly cover the XY polygon enclosed by manually chosen guides.
-
-        Automatic gap detection can be split by a few stray points from a
-        second surface.  The user's guide points are therefore also treated as
-        a spatial instruction: every grid centre inside their convex hull is
-        assigned to this prediction region.  This produces a regular lattice
-        instead of filling only one side of the apparent hole.
-        """
-        guide_points = self.guide_points_for(region_id)
-        if len(guide_points) < 3:
-            return False
-        guide_xy = np.unique(guide_points[:, :2], axis=0)
-        if len(guide_xy) < 3:
-            return False
-        gx, gy = np.meshgrid(self.x_centers, self.y_centers, indexing="ij")
-        candidates = np.column_stack((gx.ravel(), gy.ravel()))
-        try:
-            triangulation = Delaunay(guide_xy)
-            inside = triangulation.find_simplex(candidates, tol=1e-10) >= 0
-        except QhullError:
-            # Keep the old, stable guide-point behaviour: the selected points
-            # still define the fitted surface even when their XY projection
-            # cannot form a polygon.  The original prediction region remains a
-            # regular grid, so this situation must not invalidate the whole
-            # operation.
-            return False
-        polygon_mask = inside.reshape(self.observed.shape)
-        if not np.any(polygon_mask):
-            return False
-        self.manual_override_labels[
-            self.manual_override_labels == region_id
-        ] = 0
-        self.manual_override_labels[polygon_mask] = region_id
-        return True
+        return self.observed
 
     def apply_fill_strategy(
         self,
@@ -171,7 +125,6 @@ class TerrainGrid:
             raise ValueError("不支持的人工填充策略。")
         if amplitude < 0:
             raise ValueError("起伏强度不能小于零。")
-        self._extend_region_to_guide_polygon(region_id)
         mask = self.region_mask(region_id)
         if strategy == FILL_AUTO:
             self.predicted_height[mask] = self.automatic_height[mask]

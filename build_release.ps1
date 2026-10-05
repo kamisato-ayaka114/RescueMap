@@ -28,6 +28,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $colmapSource "COLMAP.bat"))) {
     --exclude-module jupyter `
     --exclude-module notebook `
     --exclude-module pandas `
+    --exclude-module sympy `
+    --exclude-module cv2 `
     --exclude-module botocore `
     --exclude-module boto3 `
     --exclude-module zmq `

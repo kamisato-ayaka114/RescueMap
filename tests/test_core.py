@@ -158,7 +158,7 @@ class TerrainTests(unittest.TestCase):
             grid.predicted_height[mask], 2.0, atol=1e-6
         )
 
-    def test_guide_polygon_uniformly_overrides_sparse_observations(self):
+    def test_guide_points_do_not_expand_the_original_prediction_region(self):
         observed = np.zeros((9, 9), dtype=bool)
         observed[:, 0] = True
         observed[:, -1] = True
@@ -190,18 +190,13 @@ class TerrainTests(unittest.TestCase):
         grid.set_guide_points(1, guides)
         grid.apply_fill_strategy(1, FILL_FLAT)
 
-        expected = np.zeros((9, 9), dtype=bool)
-        expected[1:8, 1:8] = True
-        self.assertTrue(np.all(grid.region_mask(1)[expected]))
-        self.assertTrue(np.all(grid.prediction_mask()[expected]))
-        self.assertFalse(np.any(grid.observation_mask()[expected]))
-        np.testing.assert_allclose(grid.predicted_height[expected], 2.0)
-        grid.set_decision(1, ACCEPTED)
-        mesh = build_terrain_mesh(grid, max_slope_degrees=80.0)
-        self.assertEqual(mesh.n_points, 81)
-        self.assertEqual(mesh.n_faces, 128)
+        expected_region = labels == 1
+        self.assertTrue(np.array_equal(grid.region_mask(1), expected_region))
+        self.assertTrue(np.array_equal(grid.prediction_mask(), predicted))
+        self.assertTrue(np.array_equal(grid.observation_mask(), observed))
+        np.testing.assert_allclose(grid.predicted_height[expected_region], 2.0)
 
-    def test_collinear_guides_fall_back_without_breaking_uniform_fill(self):
+    def test_collinear_guides_fit_without_expanding_the_region(self):
         observed = np.ones((7, 7), dtype=bool)
         observed[2:5, 1:6] = False
         predicted = ~observed
