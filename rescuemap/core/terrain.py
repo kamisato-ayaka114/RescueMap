@@ -64,10 +64,13 @@ class TerrainGrid:
     fill_strategies: dict[int, str] = field(default_factory=dict)
     fill_parameters: dict[int, float] = field(default_factory=dict)
     guide_points: dict[int, list[list[float]]] = field(default_factory=dict)
+    manual_fill_bounds: dict[int, list[list[float]]] = field(default_factory=dict)
     automatic_height: np.ndarray = field(init=False, repr=False)
+    manual_fill_labels: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.automatic_height = np.asarray(self.predicted_height, dtype=float).copy()
+        self.manual_fill_labels = np.zeros_like(self.region_labels, dtype=np.int32)
 
     @property
     def region_count(self) -> int:
@@ -101,17 +104,50 @@ class TerrainGrid:
         return np.asarray(points, dtype=float).reshape((-1, 3))
 
     def effective_region_labels(self) -> np.ndarray:
-        """Return the regions detected by the original terrain prediction."""
-        return self.region_labels
+        """Return automatic labels with explicit user rectangles overlaid."""
+        return np.where(
+            self.manual_fill_labels > 0,
+            self.manual_fill_labels,
+            self.region_labels,
+        )
 
     def region_mask(self, region_id: int) -> np.ndarray:
-        return (self.region_labels == region_id) & self.predicted
+        labels = self.effective_region_labels()
+        return (labels == region_id) & self.prediction_mask()
 
     def prediction_mask(self) -> np.ndarray:
-        return self.predicted
+        return self.predicted | (self.manual_fill_labels > 0)
 
     def observation_mask(self) -> np.ndarray:
-        return self.observed
+        return self.observed & (self.manual_fill_labels == 0)
+
+    def add_manual_fill_rectangle(
+        self,
+        region_id: int,
+        bounds_xy: tuple[float, float, float, float],
+    ) -> int:
+        """Assign a user-drawn XY rectangle to an existing prediction region.
+
+        The rectangle is independent from the guide points.  It deliberately
+        overrides lower/upper observations at the same XY position because the
+        user has explicitly selected which 2.5-D surface should be continued.
+        """
+        if region_id < 1 or region_id > self.region_count:
+            raise ValueError("预测区域编号无效。")
+        xmin, xmax = sorted((float(bounds_xy[0]), float(bounds_xy[1])))
+        ymin, ymax = sorted((float(bounds_xy[2]), float(bounds_xy[3])))
+        if not np.all(np.isfinite((xmin, xmax, ymin, ymax))):
+            raise ValueError("人工补充范围包含无效坐标。")
+        x_selected = (self.x_centers >= xmin) & (self.x_centers <= xmax)
+        y_selected = (self.y_centers >= ymin) & (self.y_centers <= ymax)
+        rectangle = x_selected[:, None] & y_selected[None, :]
+        if not np.any(rectangle):
+            raise ValueError("框选范围内没有地形栅格，请扩大框选范围。")
+        self.manual_fill_labels[rectangle] = region_id
+        self.manual_fill_bounds.setdefault(region_id, []).append(
+            [xmin, xmax, ymin, ymax]
+        )
+        return int(rectangle.sum())
 
     def apply_fill_strategy(
         self,
@@ -126,8 +162,14 @@ class TerrainGrid:
         if amplitude < 0:
             raise ValueError("起伏强度不能小于零。")
         mask = self.region_mask(region_id)
+        manual_mask = self.manual_fill_labels == region_id
         if strategy == FILL_AUTO:
-            self.predicted_height[mask] = self.automatic_height[mask]
+            automatic_mask = mask & ~manual_mask
+            self.predicted_height[automatic_mask] = self.automatic_height[automatic_mask]
+            if np.any(manual_mask):
+                boundary_mask = self._surrounding_observations(mask)
+                plane = self._fit_surrounding_plane(region_id, boundary_mask, mask)
+                self.predicted_height[manual_mask] = plane[manual_mask[mask]]
         else:
             boundary_mask = self._surrounding_observations(mask)
             plane = self._fit_surrounding_plane(region_id, boundary_mask, mask)
@@ -163,10 +205,10 @@ class TerrainGrid:
         expanded = region_mask.copy()
         for _ in range(12):
             expanded = binary_dilation(expanded, structure=np.ones((3, 3), dtype=bool))
-            boundary = expanded & self.observed
+            boundary = expanded & self.observation_mask()
             if int(boundary.sum()) >= 6:
                 return boundary
-        boundary = self.observed.copy()
+        boundary = self.observation_mask().copy()
         if int(boundary.sum()) < 3:
             raise ValueError("区域周围真实点不足，无法应用人工填充策略。")
         return boundary
@@ -221,6 +263,10 @@ class TerrainGrid:
         uncertainty = np.clip(
             self.distance_to_observation[ix, iy] / max_distance, 0.0, 1.0
         ).astype(np.float32)
+        # Explicitly drawn cells are geometric hypotheses confirmed by a user,
+        # not new sensor observations.  Keep them visibly low-confidence for
+        # later safety-aware path planning.
+        uncertainty[self.manual_fill_labels[ix, iy] > 0] = 1.0
         cloud = pv.PolyData(points)
         cloud.point_data["RegionId"] = regions
         cloud.point_data["PredictionUncertainty"] = uncertainty

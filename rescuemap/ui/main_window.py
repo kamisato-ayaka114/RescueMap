@@ -100,6 +100,9 @@ class MainWindow(QMainWindow):
         self.picking_target = 0
         self.picked_points: list[np.ndarray] = []
         self.guide_target_region_id: int | None = None
+        self.manual_fill_target_region_id: int | None = None
+        self.manual_fill_strategy = FILL_PLANE
+        self.manual_fill_amplitude = 0.0
         self.scene_point_tree: cKDTree | None = None
         self.mouse_press_position: tuple[float, float] | None = None
         self.rectangle_start_position: QPoint | None = None
@@ -393,7 +396,9 @@ class MainWindow(QMainWindow):
         self._position_color_legend()
 
     def eventFilter(self, watched, event):  # noqa: N802
-        if watched is self.plotter.interactor and self.picking_mode == "region-box":
+        if watched is self.plotter.interactor and self.picking_mode in (
+            "region-box", "fill-box"
+        ):
             if (
                 event.type() == QEvent.Type.MouseButtonPress
                 and event.button() == Qt.MouseButton.LeftButton
@@ -520,6 +525,8 @@ class MainWindow(QMainWindow):
         finish_box_select_button.clicked.connect(self.cancel_picking)
         guide_points_button = QPushButton("选择周围参考点，拟合目标地表")
         guide_points_button.clicked.connect(self.start_fill_guide_selection)
+        manual_fill_box_button = QPushButton("俯视框选人工补充范围")
+        manual_fill_box_button.clicked.connect(self.start_manual_fill_rectangle)
         self.region_list = QListWidget()
         self.region_list.setMinimumHeight(100)
         self.region_list.setMaximumHeight(180)
@@ -578,6 +585,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(finish_box_select_button)
         layout.addWidget(self.region_summary_label)
         layout.addWidget(guide_points_button)
+        layout.addWidget(manual_fill_box_button)
         layout.addWidget(QLabel("选择要应用的人工填充策略："))
         layout.addWidget(self.fill_strategy_combo)
         layout.addWidget(apply_strategy_button)
@@ -958,11 +966,12 @@ class MainWindow(QMainWindow):
         )
 
     def cancel_picking(self) -> None:
-        was_rectangle = self.picking_mode == "region-box"
+        was_rectangle = self.picking_mode in ("region-box", "fill-box")
         self.plotter.disable_picking()
         self.plotter.enable_trackball_style()
         self.picking_mode = None
         self.guide_target_region_id = None
+        self.manual_fill_target_region_id = None
         self.picked_points = []
         self.mouse_press_position = None
         self.rectangle_start_position = None
@@ -1140,6 +1149,114 @@ class MainWindow(QMainWindow):
         self._draw_checked_regions_highlight()
         self.statusBar().showMessage(
             f"本次框选加入{len(region_ids)}个区域；完成后点击“恢复旋转”或按Esc"
+        )
+
+    def start_manual_fill_rectangle(self) -> None:
+        region_id = self._current_region_id()
+        if self.terrain_grid is None or region_id is None:
+            QMessageBox.information(self, "没有预测区域", "请先选择一个预测区域。")
+            return
+        guide_points = self.terrain_grid.guide_points_for(region_id)
+        if len(guide_points) < 3:
+            QMessageBox.information(
+                self,
+                "请先选择参考地表",
+                "人工补充范围可能覆盖同一XY位置的其他点层。\n"
+                "请先为当前区域选择至少3个周围参考点，再框选补充范围。",
+            )
+            return
+        strategy = str(self.fill_strategy_combo.currentData())
+        if strategy == FILL_AUTO:
+            strategy = FILL_PLANE
+            self.fill_strategy_combo.setCurrentIndex(
+                self.fill_strategy_combo.findData(FILL_PLANE)
+            )
+        amplitude = self._strategy_amplitude(strategy)
+        if amplitude is None:
+            return
+        self.cancel_picking()
+        self.manual_fill_target_region_id = region_id
+        self.manual_fill_strategy = strategy
+        self.manual_fill_amplitude = float(amplitude)
+        self.picking_mode = "fill-box"
+        self.view_top()
+        self.cancel_picking_button.setText("完成补充框选，恢复旋转（Esc）")
+        self._show_picking_help(
+            f"人工补充范围：当前区域{region_id}，策略“{FILL_STRATEGY_NAMES[strategy]}”。\n"
+            "已自动切换到俯视图；按住左键拖出矩形。可连续框选，按Esc完成。"
+        )
+        self.statusBar().showMessage("左键拖框指定需要新建预测点的XY范围；按Esc完成")
+        self.plotter.enable_rectangle_picking(
+            callback=self._on_manual_fill_rectangle,
+            show_message=False,
+            start=True,
+            show_frustum=False,
+            color="#d946ef",
+        )
+
+    def _on_manual_fill_rectangle(self, selection) -> None:
+        if (
+            self.terrain_grid is None
+            or self.manual_fill_target_region_id is None
+        ):
+            return
+        region_id = self.manual_fill_target_region_id
+        guide_points = self.terrain_grid.guide_points_for(region_id)
+        reference_z = float(np.median(guide_points[:, 2]))
+        try:
+            bounds = self._rectangle_xy_bounds(selection.viewport, reference_z)
+            count = self.terrain_grid.add_manual_fill_rectangle(region_id, bounds)
+            self.terrain_grid.apply_fill_strategy(
+                region_id,
+                self.manual_fill_strategy,
+                self.manual_fill_amplitude,
+            )
+            self.terrain_mesh = None
+            self.terrain_mesh_settings = None
+            self._invalidate_path_planning()
+            self.mesh_summary_label.setText("人工补充范围已改变，请重新生成地形网格")
+            self._refresh_region_list_text()
+            self._update_region_summary()
+            self._draw_terrain_prediction()
+            self._draw_checked_regions_highlight()
+            self._draw_selected_region_highlight()
+            self._draw_region_guide_points()
+            self.plotter.render()
+            self.statusBar().showMessage(
+                f"区域{region_id}新增/覆盖{count}个规则栅格；可继续框选或按Esc完成"
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "人工补充范围无效", str(exc))
+
+    def _rectangle_xy_bounds(
+        self,
+        viewport: tuple[float, float, float, float],
+        reference_z: float,
+    ) -> tuple[float, float, float, float]:
+        """Project a top-view screen rectangle onto a horizontal XY plane."""
+        renderer = self.plotter.renderer
+        x0, y0, x1, y1 = map(float, viewport)
+        world_points: list[np.ndarray] = []
+        for x, y in ((x0, y0), (x0, y1), (x1, y0), (x1, y1)):
+            endpoints: list[np.ndarray] = []
+            for display_z in (0.0, 1.0):
+                renderer.SetDisplayPoint(x, y, display_z)
+                renderer.DisplayToWorld()
+                homogeneous = np.asarray(renderer.GetWorldPoint(), dtype=float)
+                if abs(float(homogeneous[3])) <= 1e-12:
+                    raise ValueError("无法把屏幕框选范围转换为地形坐标。")
+                endpoints.append(homogeneous[:3] / homogeneous[3])
+            direction = endpoints[1] - endpoints[0]
+            if abs(float(direction[2])) <= 1e-12:
+                raise ValueError("当前视角不是有效俯视角，请重新进入框选功能。")
+            factor = (reference_z - endpoints[0][2]) / direction[2]
+            world_points.append(endpoints[0] + factor * direction)
+        xy = np.asarray(world_points)[:, :2]
+        return (
+            float(np.min(xy[:, 0])),
+            float(np.max(xy[:, 0])),
+            float(np.min(xy[:, 1])),
+            float(np.max(xy[:, 1])),
         )
 
     def _finish_map_region_selection(
@@ -1386,10 +1503,22 @@ class MainWindow(QMainWindow):
         return f"区域 {region_id}｜{info['cells']}格｜{strategy}｜{display}"
 
     def _refresh_region_list_text(self) -> None:
-        for index in range(self.region_list.count()):
+        if self.terrain_grid is None:
+            return
+        self.region_list.blockSignals(True)
+        self.region_combo.blockSignals(True)
+        for index in range(self.region_list.count() - 1, -1, -1):
             item = self.region_list.item(index)
             region_id = int(item.data(Qt.ItemDataRole.UserRole))
+            if not np.any(self.terrain_grid.region_mask(region_id)):
+                self.region_list.takeItem(index)
+                combo_index = self.region_combo.findData(region_id)
+                if combo_index >= 0:
+                    self.region_combo.removeItem(combo_index)
+                continue
             item.setText(self._region_list_text(region_id))
+        self.region_list.blockSignals(False)
+        self.region_combo.blockSignals(False)
 
     def _select_region_from_list(
         self, current: QListWidgetItem | None, previous: QListWidgetItem | None
@@ -2137,9 +2266,10 @@ class MainWindow(QMainWindow):
                 "fill_strategies": self.terrain_grid.fill_strategies,
                 "fill_parameters": self.terrain_grid.fill_parameters,
                 "guide_points": self.terrain_grid.guide_points,
+                "manual_fill_bounds": self.terrain_grid.manual_fill_bounds,
             }
         data = {
-            "version": 6,
+            "version": 7,
             "model_path": str(self.scene.path),
             "calibration_matrix": self.scene.calibration_matrix.tolist(),
             "unit_name": self.scene.unit_name,
@@ -2222,6 +2352,15 @@ class MainWindow(QMainWindow):
                     bounds_xy=self.terrain_roi,
                     **self.terrain_settings,
                 )
+                for region_id, rectangles in terrain.get(
+                    "manual_fill_bounds", {}
+                ).items():
+                    region_id = int(region_id)
+                    if region_id <= self.terrain_grid.region_count:
+                        for bounds in rectangles:
+                            self.terrain_grid.add_manual_fill_rectangle(
+                                region_id, tuple(map(float, bounds))
+                            )
                 for region_id, guide_points in terrain.get("guide_points", {}).items():
                     region_id = int(region_id)
                     if region_id <= self.terrain_grid.region_count:

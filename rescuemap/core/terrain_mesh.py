@@ -75,6 +75,10 @@ def build_terrain_mesh(
             0.05,
             0.99,
         ).astype(np.float32)
+        manual_prediction = grid.manual_fill_labels[ix, iy] > 0
+        confidence[manual_prediction] = np.minimum(
+            confidence[manual_prediction], 0.35
+        )
 
     max_slope = np.tan(np.deg2rad(max_slope_degrees))
     triangle_indices: list[tuple[int, int, int]] = []

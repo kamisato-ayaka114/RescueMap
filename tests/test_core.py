@@ -11,6 +11,7 @@ from rescuemap.core.calibration import (
 )
 from rescuemap.core.terrain import (
     ACCEPTED,
+    FILL_AUTO,
     FILL_CONCAVE,
     FILL_CONVEX,
     FILL_FLAT,
@@ -195,6 +196,53 @@ class TerrainTests(unittest.TestCase):
         self.assertTrue(np.array_equal(grid.prediction_mask(), predicted))
         self.assertTrue(np.array_equal(grid.observation_mask(), observed))
         np.testing.assert_allclose(grid.predicted_height[expected_region], 2.0)
+
+    def test_explicit_rectangle_adds_regular_cells_and_overrides_wrong_layer(self):
+        observed = np.ones((9, 9), dtype=bool)
+        predicted = np.zeros((9, 9), dtype=bool)
+        predicted[2:4, 1:8] = True
+        observed[predicted] = False
+        labels = np.zeros((9, 9), dtype=np.int32)
+        labels[predicted] = 1
+        grid = TerrainGrid(
+            x_centers=np.arange(9, dtype=float),
+            y_centers=np.arange(9, dtype=float),
+            observed_height=np.where(observed, 0.5, np.nan),
+            predicted_height=np.where(predicted, 2.0, 0.5),
+            observed=observed,
+            predicted=predicted,
+            distance_to_observation=distance_transform_edt(~observed),
+            region_labels=labels,
+            cell_size=1.0,
+            min_points=1,
+            algorithm="harmonic",
+        )
+        guides = np.array(
+            [[1.0, 1.0, 2.0], [7.0, 1.0, 2.0],
+             [7.0, 7.0, 2.0], [1.0, 7.0, 2.0]]
+        )
+        grid.set_guide_points(1, guides)
+
+        count = grid.add_manual_fill_rectangle(1, (2.0, 6.0, 1.0, 7.0))
+        grid.apply_fill_strategy(1, FILL_FLAT)
+
+        rectangle = np.zeros((9, 9), dtype=bool)
+        rectangle[2:7, 1:8] = True
+        self.assertEqual(count, int(rectangle.sum()))
+        self.assertTrue(np.all(grid.region_mask(1)[rectangle]))
+        self.assertFalse(np.any(grid.observation_mask()[rectangle]))
+        np.testing.assert_allclose(grid.predicted_height[rectangle], 2.0)
+        self.assertEqual(grid.manual_fill_bounds[1], [[2.0, 6.0, 1.0, 7.0]])
+        prediction_xy = np.asarray(grid.prediction_polydata().points)[:, :2]
+        self.assertEqual(len(prediction_xy), len(np.unique(prediction_xy, axis=0)))
+
+        # Returning to automatic mode keeps explicitly drawn cells on the
+        # guide-point surface instead of exposing the lower observed layer.
+        grid.apply_fill_strategy(1, FILL_AUTO)
+        np.testing.assert_allclose(grid.predicted_height[rectangle], 2.0)
+        grid.set_decision(1, ACCEPTED)
+        mesh = build_terrain_mesh(grid, max_slope_degrees=89.0)
+        self.assertTrue(np.any(np.asarray(mesh.point_data["Confidence"]) <= 0.35))
 
     def test_collinear_guides_fit_without_expanding_the_region(self):
         observed = np.ones((7, 7), dtype=bool)
