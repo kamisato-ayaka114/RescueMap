@@ -123,7 +123,7 @@ class TerrainGrid:
     def observation_mask(self) -> np.ndarray:
         return self.observed & (self.manual_override_labels == 0)
 
-    def _extend_region_to_guide_polygon(self, region_id: int) -> None:
+    def _extend_region_to_guide_polygon(self, region_id: int) -> bool:
         """Uniformly cover the XY polygon enclosed by manually chosen guides.
 
         Automatic gap detection can be split by a few stray points from a
@@ -134,27 +134,30 @@ class TerrainGrid:
         """
         guide_points = self.guide_points_for(region_id)
         if len(guide_points) < 3:
-            return
+            return False
         guide_xy = np.unique(guide_points[:, :2], axis=0)
         if len(guide_xy) < 3:
-            return
+            return False
         gx, gy = np.meshgrid(self.x_centers, self.y_centers, indexing="ij")
         candidates = np.column_stack((gx.ravel(), gy.ravel()))
         try:
             triangulation = Delaunay(guide_xy)
             inside = triangulation.find_simplex(candidates, tol=1e-10) >= 0
-        except QhullError as exc:
-            raise ValueError(
-                "参考点在俯视方向几乎共线，无法围成补充区域；"
-                "请在空白区域四周选择至少3个不共线点。"
-            ) from exc
+        except QhullError:
+            # Keep the old, stable guide-point behaviour: the selected points
+            # still define the fitted surface even when their XY projection
+            # cannot form a polygon.  The original prediction region remains a
+            # regular grid, so this situation must not invalidate the whole
+            # operation.
+            return False
         polygon_mask = inside.reshape(self.observed.shape)
         if not np.any(polygon_mask):
-            raise ValueError("参考点围成的范围内没有地形栅格，请重新选择参考点。")
+            return False
         self.manual_override_labels[
             self.manual_override_labels == region_id
         ] = 0
         self.manual_override_labels[polygon_mask] = region_id
+        return True
 
     def apply_fill_strategy(
         self,

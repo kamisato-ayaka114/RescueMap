@@ -1233,15 +1233,19 @@ class MainWindow(QMainWindow):
             or self.guide_target_region_id is None
         ):
             return
-        region_id = self._resolve_guide_region_id(
-            self.guide_target_region_id, points
-        )
+        # Keep the guide points attached to the region chosen before picking.
+        # Automatically guessing another region from the picked-point centroid
+        # made the operation unpredictable when upper and lower surfaces
+        # overlapped in XY.  This is the stable behaviour used by the earlier
+        # version of the tool.
+        region_id = self.guide_target_region_id
         self.guide_target_region_id = None
-        if region_id is None:
+        if not np.any(self.terrain_grid.region_mask(region_id)):
+            self._populate_regions()
             QMessageBox.warning(
                 self,
-                "没有可用预测区域",
-                "参考点附近没有找到有效预测区域，请重新生成预测后再选择。",
+                "区域已经变化",
+                "选点期间预测区域发生了变化，请重新选择目标区域。",
             )
             return
         if self.scene_point_tree is None:
@@ -1266,40 +1270,6 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             QMessageBox.critical(self, "参考点拟合失败", str(exc))
-
-    def _resolve_guide_region_id(
-        self, preferred_region_id: int, points: np.ndarray
-    ) -> int | None:
-        """Keep guide picking robust when region controls became stale."""
-        if self.terrain_grid is None:
-            return None
-        valid_region_ids = [
-            region_id
-            for region_id in range(1, self.terrain_grid.region_count + 1)
-            if np.any(self.terrain_grid.region_mask(region_id))
-        ]
-        if preferred_region_id in valid_region_ids:
-            return preferred_region_id
-        prediction_cloud = self.terrain_grid.prediction_polydata()
-        if prediction_cloud.n_points == 0 or not valid_region_ids:
-            return None
-        cloud_points = np.asarray(prediction_cloud.points, dtype=float)
-        cloud_regions = np.asarray(
-            prediction_cloud.point_data["RegionId"], dtype=np.int32
-        )
-        valid = np.isin(cloud_regions, valid_region_ids)
-        if not np.any(valid):
-            return None
-        center = np.mean(np.asarray(points, dtype=float), axis=0)
-        horizontal_distance = np.linalg.norm(
-            cloud_points[valid, :2] - center[:2], axis=1
-        )
-        nearest = int(np.argmin(horizontal_distance))
-        resolved = int(cloud_regions[valid][nearest])
-        self.statusBar().showMessage(
-            f"原区域编号已经变化，已自动匹配到区域{resolved}"
-        )
-        return resolved
 
     def _finish_roi_selection(self, points: np.ndarray) -> None:
         xmin, xmax = sorted((float(points[0, 0]), float(points[1, 0])))

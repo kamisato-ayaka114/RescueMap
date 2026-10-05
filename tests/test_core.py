@@ -201,6 +201,39 @@ class TerrainTests(unittest.TestCase):
         self.assertEqual(mesh.n_points, 81)
         self.assertEqual(mesh.n_faces, 128)
 
+    def test_collinear_guides_fall_back_without_breaking_uniform_fill(self):
+        observed = np.ones((7, 7), dtype=bool)
+        observed[2:5, 1:6] = False
+        predicted = ~observed
+        labels = np.zeros((7, 7), dtype=np.int32)
+        labels[predicted] = 1
+        grid = TerrainGrid(
+            x_centers=np.arange(7, dtype=float),
+            y_centers=np.arange(7, dtype=float),
+            observed_height=np.where(observed, 2.0, np.nan),
+            predicted_height=np.full((7, 7), 2.0),
+            observed=observed,
+            predicted=predicted,
+            distance_to_observation=distance_transform_edt(~observed),
+            region_labels=labels,
+            cell_size=1.0,
+            min_points=1,
+            algorithm="harmonic",
+        )
+        # These points are sufficient for the old surface-trend selection but
+        # cannot enclose an XY polygon.  The operation should still succeed.
+        guides = np.array(
+            [[1.0, 1.0, 2.0], [2.0, 1.0, 2.0],
+             [3.0, 1.0, 2.0], [4.0, 1.0, 2.0]]
+        )
+        grid.set_guide_points(1, guides)
+        grid.apply_fill_strategy(1, FILL_FLAT)
+
+        np.testing.assert_allclose(grid.predicted_height[predicted], 2.0)
+        prediction_points = grid.prediction_polydata().points
+        self.assertEqual(len(prediction_points), int(predicted.sum()))
+        self.assertEqual(len(np.unique(prediction_points[:, :2], axis=0)), len(prediction_points))
+
     def test_region_surface_preview_uses_regular_grid_adjacency(self):
         predicted = np.zeros((5, 5), dtype=bool)
         predicted[1:4, 1:4] = True
