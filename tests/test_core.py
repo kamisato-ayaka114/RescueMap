@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pyvista as pv
@@ -9,6 +10,8 @@ from rescuemap.core.calibration import (
     ground_alignment_transform,
     uniform_scale_transform,
 )
+from rescuemap.core.colmap_runner import build_colmap_stages
+from rescuemap.core.dynamic_mask import _clustered_dynamic_cells
 from rescuemap.core.terrain import (
     ACCEPTED,
     FILL_AUTO,
@@ -22,6 +25,40 @@ from rescuemap.core.terrain import (
 from rescuemap.core.scene import SceneModel
 from rescuemap.core.path_planning import plan_safe_path
 from rescuemap.core.terrain_mesh import build_terrain_mesh
+
+
+class DynamicSuppressionTests(unittest.TestCase):
+    def test_only_clustered_rejections_expand_into_mask_cells(self):
+        rejected = np.zeros((7, 7), dtype=np.int32)
+        observed = np.zeros_like(rejected)
+        rejected[3, 3] = observed[3, 3] = 10
+        rejected[3, 4] = observed[3, 4] = 10
+        rejected[0, 0] = observed[0, 0] = 20
+
+        dynamic = _clustered_dynamic_cells(rejected, observed)
+
+        self.assertTrue(dynamic[3, 3])
+        self.assertTrue(dynamic[2, 3])
+        self.assertFalse(dynamic[0, 0])
+
+    def test_two_pass_pipeline_uses_generated_static_images_and_masks(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            stages = build_colmap_stages(
+                root / "colmap.exe",
+                root / "images",
+                workspace,
+                "standard",
+                True,
+            )
+
+            self.assertEqual(len(stages), 11)
+            self.assertEqual(stages[3].kind, "generate_masks")
+            formal_feature = stages[4]
+            self.assertIn("--ImageReader.mask_path", formal_feature.arguments)
+            self.assertIn(str(workspace / "static_images"), formal_feature.arguments)
 
 
 class CalibrationTests(unittest.TestCase):
@@ -443,6 +480,34 @@ class TerrainTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "没有生成任何三角面"):
             build_terrain_mesh(grid, max_slope_degrees=45.0)
+
+    def test_mesh_keeps_steep_faces_inside_accepted_prediction(self):
+        predicted = np.ones((3, 3), dtype=bool)
+        labels = np.ones((3, 3), dtype=np.int32)
+        grid = TerrainGrid(
+            x_centers=np.arange(3, dtype=float),
+            y_centers=np.arange(3, dtype=float),
+            observed_height=np.full((3, 3), np.nan),
+            predicted_height=np.array(
+                [[0.0, 0.0, 0.0], [5.0, 5.0, 5.0], [10.0, 10.0, 10.0]]
+            ),
+            observed=np.zeros((3, 3), dtype=bool),
+            predicted=predicted,
+            distance_to_observation=np.ones((3, 3)),
+            region_labels=labels,
+            cell_size=1.0,
+            min_points=1,
+            algorithm="harmonic",
+        )
+        grid.set_decision(1, ACCEPTED)
+
+        mesh = build_terrain_mesh(grid, max_slope_degrees=10.0)
+
+        self.assertEqual(mesh.n_cells, 8)
+        self.assertTrue(np.all(mesh.cell_data["FaceSource"] == 1))
+        self.assertEqual(
+            int(mesh.field_data["AcceptedPredictionFaces"].ravel()[0]), 8
+        )
 
 
 class PathPlanningTests(unittest.TestCase):

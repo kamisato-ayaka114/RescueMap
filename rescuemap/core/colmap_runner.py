@@ -5,7 +5,9 @@ from datetime import datetime
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import QObject, QProcess, Signal
+from PySide6.QtCore import QObject, QProcess, QTimer, Signal
+
+from rescuemap.core.dynamic_mask import generate_geometry_masks
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
@@ -36,6 +38,7 @@ class _Stage:
     title: str
     command: str
     arguments: tuple[str, ...]
+    kind: str = "process"
 
 
 def resolve_colmap_executable(selected_path: Path) -> Path:
@@ -95,6 +98,7 @@ def build_colmap_stages(
     image_directory: Path,
     workspace: Path,
     quality: str,
+    dynamic_suppression: bool = False,
 ) -> list[_Stage]:
     max_features, max_image_size = _quality_parameters(quality)
     database = workspace / "database.db"
@@ -105,17 +109,68 @@ def build_colmap_stages(
     mesh = dense / "meshed-poisson.ply"
     exe = str(executable)
 
-    return [
-        _Stage(
-            "提取图像特征",
-            exe,
-            (
-                "feature_extractor",
-                "--database_path", str(database),
-                "--image_path", str(image_directory),
-                "--ImageReader.single_camera", "1",
-                "--SiftExtraction.max_num_features", max_features,
+    formal_image_directory = image_directory
+    formal_mask_directory: Path | None = None
+    preview_stages: list[_Stage] = []
+    if dynamic_suppression:
+        preview_root = workspace / "dynamic_preview"
+        preview_database = preview_root / "database.db"
+        preview_sparse = preview_root / "sparse"
+        preview_root.mkdir(parents=True, exist_ok=True)
+        preview_sparse.mkdir(parents=True, exist_ok=True)
+        formal_image_directory = workspace / "static_images"
+        formal_mask_directory = workspace / "dynamic_masks"
+        preview_stages = [
+            _Stage(
+                "快速提取低分辨率特征",
+                exe,
+                (
+                    "feature_extractor",
+                    "--database_path", str(preview_database),
+                    "--image_path", str(image_directory),
+                    "--ImageReader.single_camera", "1",
+                    "--SiftExtraction.max_num_features", "2048",
+                    "--FeatureExtraction.max_image_size", "1200",
+                ),
             ),
+            _Stage(
+                "快速匹配相邻图像",
+                exe,
+                (
+                    "sequential_matcher",
+                    "--database_path", str(preview_database),
+                    "--SequentialMatching.overlap", "2",
+                ),
+            ),
+            _Stage(
+                "估计预览相机位姿",
+                exe,
+                (
+                    "mapper",
+                    "--database_path", str(preview_database),
+                    "--image_path", str(image_directory),
+                    "--output_path", str(preview_sparse),
+                ),
+                "mapper_preview",
+            ),
+            _Stage("分析跨帧几何并生成动态掩膜", "", (), "generate_masks"),
+        ]
+
+    feature_arguments = [
+        "feature_extractor",
+        "--database_path", str(database),
+        "--image_path", str(formal_image_directory),
+        "--ImageReader.single_camera", "1",
+        "--SiftExtraction.max_num_features", max_features,
+    ]
+    if formal_mask_directory is not None:
+        feature_arguments.extend(("--ImageReader.mask_path", str(formal_mask_directory)))
+
+    formal_stages = [
+        _Stage(
+            "正式提取静态图像特征" if dynamic_suppression else "提取图像特征",
+            exe,
+            tuple(feature_arguments),
         ),
         _Stage(
             "匹配图像特征",
@@ -128,16 +183,17 @@ def build_colmap_stages(
             (
                 "mapper",
                 "--database_path", str(database),
-                "--image_path", str(image_directory),
+                "--image_path", str(formal_image_directory),
                 "--output_path", str(sparse),
             ),
+            "mapper_final",
         ),
         _Stage(
             "校正图像",
             exe,
             (
                 "image_undistorter",
-                "--image_path", str(image_directory),
+                "--image_path", str(formal_image_directory),
                 "--input_path", str(sparse_model),
                 "--output_path", str(dense),
                 "--output_type", "COLMAP",
@@ -173,6 +229,7 @@ def build_colmap_stages(
             ("poisson_mesher", "--input_path", str(fused), "--output_path", str(mesh)),
         ),
     ]
+    return preview_stages + formal_stages
 
 
 class ColmapRunner(QObject):
@@ -194,6 +251,7 @@ class ColmapRunner(QObject):
         self._stages: list[_Stage] = []
         self._stage_index = -1
         self._workspace: Path | None = None
+        self._image_directory: Path | None = None
         self._cancelled = False
 
     @property
@@ -206,6 +264,7 @@ class ColmapRunner(QObject):
         image_directory: Path,
         project_directory: Path,
         quality: str = "standard",
+        dynamic_suppression: bool = False,
     ) -> Path:
         if self.is_running:
             raise RuntimeError("已有重建任务正在运行。")
@@ -223,14 +282,20 @@ class ColmapRunner(QObject):
 
         workspace = create_run_workspace(project_directory)
         self._workspace = workspace
+        self._image_directory = image_directory
         self._stages = build_colmap_stages(
-            executable, image_directory, workspace, quality
+            executable,
+            image_directory,
+            workspace,
+            quality,
+            dynamic_suppression,
         )
         self._stage_index = -1
         self._cancelled = False
         self.log_received.emit(
             f"COLMAP：{executable}\n照片：{image_directory}\n"
             f"照片数量：{image_count}\n本次工作区：{workspace}\n"
+            f"动态干扰自动抑制：{'开启' if dynamic_suppression else '关闭'}\n"
         )
         self.running_changed.emit(True)
         self._start_next_stage()
@@ -258,6 +323,15 @@ class ColmapRunner(QObject):
         )
         if self._workspace is not None:
             self.process.setWorkingDirectory(str(self._workspace))
+        if stage.kind == "generate_masks":
+            try:
+                self._generate_dynamic_masks()
+            except Exception as exc:
+                self.running_changed.emit(False)
+                self.failed.emit(f"自动生成动态区域掩膜失败：{exc}")
+                return
+            QTimer.singleShot(0, self._start_next_stage)
+            return
         self.process.start(stage.command, list(stage.arguments))
 
     def _read_output(self) -> None:
@@ -278,19 +352,24 @@ class ColmapRunner(QObject):
                 f"“{stage.title}”执行失败（退出代码 {exit_code}）。请查看重建日志。"
             )
             return
-        if self._stage_index == 2:
+        stage = self._stages[self._stage_index]
+        if stage.kind in {"mapper_preview", "mapper_final"}:
             try:
-                self._select_sparse_model()
+                self._select_sparse_model(stage.kind)
             except Exception as exc:
                 self.running_changed.emit(False)
                 self.failed.emit(str(exc))
                 return
         self._start_next_stage()
 
-    def _select_sparse_model(self) -> None:
+    def _select_sparse_model(self, mapper_kind: str) -> None:
         """Use the largest registered sparse model when mapper creates several."""
         assert self._workspace is not None
-        sparse_root = self._workspace / "sparse"
+        sparse_root = (
+            self._workspace / "dynamic_preview" / "sparse"
+            if mapper_kind == "mapper_preview"
+            else self._workspace / "sparse"
+        )
         models = [
             path
             for path in sparse_root.iterdir()
@@ -300,17 +379,48 @@ class ColmapRunner(QObject):
             and (path / "points3D.bin").is_file()
         ]
         if not models:
+            if mapper_kind == "mapper_preview":
+                self.log_received.emit(
+                    "警告：快速阶段没有形成完整稀疏模型；将使用已经完成的两视图"
+                    "几何验证继续生成保守掩膜。\n"
+                )
+                return
             raise RuntimeError(
                 "稀疏重建没有生成有效模型。通常是照片重叠率不足、纹理太少，"
                 "或相邻照片视角变化过大。"
             )
         selected = max(models, key=lambda path: (path / "images.bin").stat().st_size)
-        stage = self._stages[3]
-        arguments = list(stage.arguments)
-        input_index = arguments.index("--input_path") + 1
-        arguments[input_index] = str(selected)
-        self._stages[3] = _Stage(stage.title, stage.command, tuple(arguments))
-        self.log_received.emit(f"选用稀疏模型：{selected.name}\n")
+        if mapper_kind == "mapper_final":
+            undistort_index = next(
+                index
+                for index, stage in enumerate(self._stages)
+                if stage.arguments and stage.arguments[0] == "image_undistorter"
+            )
+            stage = self._stages[undistort_index]
+            arguments = list(stage.arguments)
+            input_index = arguments.index("--input_path") + 1
+            arguments[input_index] = str(selected)
+            self._stages[undistort_index] = _Stage(
+                stage.title, stage.command, tuple(arguments), stage.kind
+            )
+        label = "预览" if mapper_kind == "mapper_preview" else "正式"
+        self.log_received.emit(f"选用{label}稀疏模型：{selected.name}\n")
+
+    def _generate_dynamic_masks(self) -> None:
+        assert self._workspace is not None
+        assert self._image_directory is not None
+        summary = generate_geometry_masks(
+            self._workspace / "dynamic_preview" / "database.db",
+            self._image_directory,
+            self._workspace / "dynamic_masks",
+            self._workspace / "static_images",
+        )
+        self.log_received.emit(
+            "动态区域掩膜生成完成："
+            f"{summary.masked_image_count}/{summary.image_count} 张照片检测到高置信动态区域，"
+            f"屏蔽像素占比 {summary.masked_ratio * 100:.2f}%\n"
+            "掩膜采用保守策略；不确定区域继续保留。\n"
+        )
 
     def _process_error(self, error) -> None:
         if self._cancelled:

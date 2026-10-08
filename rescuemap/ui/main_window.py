@@ -90,7 +90,7 @@ class CollapsibleGroupBox(QGroupBox):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("RescueMap Viewer 0.7")
+        self.setWindowTitle("RescueMap Viewer 0.8")
         self.scene: SceneModel | None = None
         self.density_result: DensityResult | None = None
         self.color_mode = "original"
@@ -222,6 +222,15 @@ class MainWindow(QMainWindow):
         self.reconstruction_quality_combo.addItem("高质量重建", "high")
         self.reconstruction_quality_combo.setCurrentIndex(1)
 
+        self.dynamic_suppression_checkbox = QCheckBox(
+            "自动抑制跨帧移动物体（推荐）"
+        )
+        self.dynamic_suppression_checkbox.setChecked(True)
+        self.dynamic_suppression_checkbox.setToolTip(
+            "先进行一次低分辨率快速重建，根据相邻照片的几何不一致区域自动生成掩膜，"
+            "再进行正式重建。会增加一些处理时间。"
+        )
+
         buttons = QHBoxLayout()
         self.start_reconstruction_button = QPushButton("开始一键重建")
         self.start_reconstruction_button.clicked.connect(self.start_reconstruction)
@@ -251,6 +260,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(colmap_button)
         layout.addWidget(QLabel("重建质量："))
         layout.addWidget(self.reconstruction_quality_combo)
+        layout.addWidget(self.dynamic_suppression_checkbox)
         layout.addLayout(buttons)
         layout.addWidget(self.reconstruction_progress)
         layout.addWidget(self.reconstruction_log)
@@ -285,6 +295,7 @@ class MainWindow(QMainWindow):
                 Path(self.image_directory_edit.text().strip()),
                 Path(self.project_directory_edit.text().strip()),
                 str(self.reconstruction_quality_combo.currentData()),
+                self.dynamic_suppression_checkbox.isChecked(),
             )
             self.settings.setValue("colmap_path", self.colmap_path_edit.text().strip())
             self.statusBar().showMessage(f"正在重建：{workspace}")
@@ -307,6 +318,7 @@ class MainWindow(QMainWindow):
     def _set_reconstruction_running(self, running: bool) -> None:
         self.start_reconstruction_button.setEnabled(not running)
         self.cancel_reconstruction_button.setEnabled(running)
+        self.dynamic_suppression_checkbox.setEnabled(not running)
 
     def _reconstruction_failed(self, message: str) -> None:
         self.reconstruction_progress.setFormat("重建未完成")
@@ -321,10 +333,16 @@ class MainWindow(QMainWindow):
         self.show_full_map_checkbox.setChecked(True)
         self.reconstruction_progress.setFormat("重建与地图加载完成")
         self.statusBar().showMessage(f"重建完成：{result.workspace}")
+        dynamic_message = (
+            "已执行跨帧几何动态干扰抑制；掩膜和静态化照片保存在本次工作区。\n\n"
+            if self.dynamic_suppression_checkbox.isChecked()
+            else ""
+        )
         QMessageBox.information(
             self,
             "重建完成",
             "稠密点云和 Poisson 网格已经生成并自动加载。\n\n"
+            f"{dynamic_message}"
             f"工作区：{result.workspace}",
         )
 
@@ -1820,8 +1838,9 @@ class MainWindow(QMainWindow):
             self,
             "生成地形网格",
             "允许连接的最大坡度（度）：\n"
-            "超过此坡度的三角面会被保留为空白。",
-            60.0,
+            "仅筛除包含真实观测点的过陡连接。\n"
+            "完全由已接受预测点组成的表面会连续建网，是否可走由路径规划判断。",
+            75.0,
             1.0,
             89.0,
             1,
@@ -1915,6 +1934,18 @@ class MainWindow(QMainWindow):
             slope = self.terrain_mesh_settings.get("max_slope_degrees")
             if slope is not None and np.isfinite(slope):
                 lines.append(f"最大连接坡度：{slope:.1f}°")
+        if "SlopeRejectedFaces" in self.terrain_mesh.field_data:
+            rejected = int(
+                np.asarray(self.terrain_mesh.field_data["SlopeRejectedFaces"]).ravel()[0]
+            )
+            lines.append(f"因观测连接过陡而跳过：{rejected:,}面")
+        if "AcceptedPredictionFaces" in self.terrain_mesh.field_data:
+            retained = int(
+                np.asarray(
+                    self.terrain_mesh.field_data["AcceptedPredictionFaces"]
+                ).ravel()[0]
+            )
+            lines.append(f"连续保留的已接受预测面：{retained:,}")
         if self.terrain_mesh_path is not None:
             lines.append(f"文件：{self.terrain_mesh_path.name}")
         self.mesh_summary_label.setText("\n".join(lines))
