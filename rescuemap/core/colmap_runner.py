@@ -252,6 +252,7 @@ class ColmapRunner(QObject):
         self._stage_index = -1
         self._workspace: Path | None = None
         self._image_directory: Path | None = None
+        self._dynamic_strength = "conservative"
         self._cancelled = False
 
     @property
@@ -265,6 +266,7 @@ class ColmapRunner(QObject):
         project_directory: Path,
         quality: str = "standard",
         dynamic_suppression: bool = False,
+        dynamic_strength: str = "conservative",
     ) -> Path:
         if self.is_running:
             raise RuntimeError("已有重建任务正在运行。")
@@ -283,6 +285,7 @@ class ColmapRunner(QObject):
         workspace = create_run_workspace(project_directory)
         self._workspace = workspace
         self._image_directory = image_directory
+        self._dynamic_strength = dynamic_strength
         self._stages = build_colmap_stages(
             executable,
             image_directory,
@@ -296,6 +299,11 @@ class ColmapRunner(QObject):
             f"COLMAP：{executable}\n照片：{image_directory}\n"
             f"照片数量：{image_count}\n本次工作区：{workspace}\n"
             f"动态干扰自动抑制：{'开启' if dynamic_suppression else '关闭'}\n"
+            + (
+                f"动态抑制强度：{dynamic_strength}\n"
+                if dynamic_suppression
+                else ""
+            )
         )
         self.running_changed.emit(True)
         self._start_next_stage()
@@ -414,12 +422,16 @@ class ColmapRunner(QObject):
             self._image_directory,
             self._workspace / "dynamic_masks",
             self._workspace / "static_images",
+            strength=self._dynamic_strength,
+            preview_directory=self._workspace / "dynamic_mask_previews",
+            report_path=self._workspace / "dynamic_report.json",
         )
         self.log_received.emit(
             "动态区域掩膜生成完成："
             f"{summary.masked_image_count}/{summary.image_count} 张照片检测到高置信动态区域，"
             f"屏蔽像素占比 {summary.masked_ratio * 100:.2f}%\n"
-            "掩膜采用保守策略；不确定区域继续保留。\n"
+            f"平均几何静态可见率 {summary.mean_static_visibility * 100:.2f}%\n"
+            "掩膜预览与逐图统计已经保存；不确定区域继续保留。\n"
         )
 
     def _process_error(self, error) -> None:

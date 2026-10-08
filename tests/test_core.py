@@ -11,7 +11,10 @@ from rescuemap.core.calibration import (
     uniform_scale_transform,
 )
 from rescuemap.core.colmap_runner import build_colmap_stages
-from rescuemap.core.dynamic_mask import _clustered_dynamic_cells
+from rescuemap.core.dynamic_mask import (
+    _clustered_dynamic_cells,
+    _point_level_dynamic_mask,
+)
 from rescuemap.core.terrain import (
     ACCEPTED,
     FILL_AUTO,
@@ -19,6 +22,7 @@ from rescuemap.core.terrain import (
     FILL_CONVEX,
     FILL_FLAT,
     FILL_PLANE,
+    FILL_QUADRATIC,
     TerrainGrid,
     build_terrain_grid,
 )
@@ -38,11 +42,24 @@ class DynamicSuppressionTests(unittest.TestCase):
         dynamic = _clustered_dynamic_cells(rejected, observed)
 
         self.assertTrue(dynamic[3, 3])
-        self.assertTrue(dynamic[2, 3])
+        self.assertFalse(dynamic[2, 3])
         self.assertFalse(dynamic[0, 0])
 
+    def test_point_mask_does_not_remove_the_complete_grid_cell(self):
+        cells = np.zeros((4, 4), dtype=bool)
+        cells[1, 1] = True
+        evidence = [(np.array([15.0, 15.0]), True)]
+
+        mask = _point_level_dynamic_mask(
+            40, 40, 10, cells, evidence, radius_scale=0.4
+        )
+
+        self.assertTrue(mask[15, 15])
+        self.assertFalse(mask[10, 10])
+        self.assertLess(int(mask.sum()), 10 * 10)
+
     def test_two_pass_pipeline_uses_generated_static_images_and_masks(self):
-        with TemporaryDirectory() as temporary_directory:
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
             root = Path(temporary_directory)
             workspace = root / "workspace"
             workspace.mkdir()
@@ -195,6 +212,52 @@ class TerrainTests(unittest.TestCase):
         np.testing.assert_allclose(
             grid.predicted_height[mask], 2.0, atol=1e-6
         )
+
+    def test_quadratic_fill_recovers_a_gently_curved_occluded_surface(self):
+        coordinates = np.arange(11, dtype=float)
+        x, y = np.meshgrid(coordinates, coordinates, indexing="ij")
+        expected = (
+            2.0
+            + 0.02 * (x - 5.0) ** 2
+            + 0.01 * (y - 5.0) ** 2
+            + 0.005 * (x - 5.0) * (y - 5.0)
+            + 0.1 * (x - 5.0)
+        )
+        predicted = np.zeros((11, 11), dtype=bool)
+        predicted[3:8, 3:8] = True
+        observed = ~predicted
+        labels = np.zeros((11, 11), dtype=np.int32)
+        labels[predicted] = 1
+        grid = TerrainGrid(
+            x_centers=coordinates,
+            y_centers=coordinates,
+            observed_height=np.where(observed, expected, np.nan),
+            predicted_height=np.where(predicted, 0.0, expected),
+            observed=observed,
+            predicted=predicted,
+            distance_to_observation=distance_transform_edt(~observed),
+            region_labels=labels,
+            cell_size=1.0,
+            min_points=1,
+            algorithm="harmonic",
+        )
+        guide_xy = np.array(
+            [
+                [2, 2], [5, 2], [8, 2], [8, 5], [8, 8], [5, 8],
+                [2, 8], [2, 5], [1, 3], [9, 3], [9, 7], [1, 7],
+            ],
+            dtype=int,
+        )
+        guide_z = expected[guide_xy[:, 0], guide_xy[:, 1]]
+        guides = np.column_stack((guide_xy, guide_z))
+        grid.set_guide_points(1, guides)
+
+        grid.apply_fill_strategy(1, FILL_QUADRATIC)
+
+        np.testing.assert_allclose(
+            grid.predicted_height[predicted], expected[predicted], atol=1e-6
+        )
+        self.assertEqual(grid.fill_strategy_for(1), FILL_QUADRATIC)
 
     def test_guide_points_do_not_expand_the_original_prediction_region(self):
         observed = np.zeros((9, 9), dtype=bool)

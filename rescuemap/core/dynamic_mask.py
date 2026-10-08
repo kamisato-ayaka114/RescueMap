@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import shutil
 import sqlite3
 
 import numpy as np
-from PIL import Image
-from scipy.ndimage import binary_dilation, convolve
+from PIL import Image, ImageDraw
+from scipy.ndimage import convolve
 
 
 MAX_IMAGE_ID = 2_147_483_647
@@ -19,6 +20,8 @@ class DynamicMaskSummary:
     masked_image_count: int
     masked_pixel_count: int
     total_pixel_count: int
+    mean_static_visibility: float = 1.0
+    report_path: Path | None = None
 
     @property
     def masked_ratio(self) -> float:
@@ -66,9 +69,44 @@ def _clustered_dynamic_cells(
         seeds.astype(np.int8), np.ones((3, 3), dtype=np.int8), mode="constant"
     )
     clustered = seeds & (seed_neighbors >= 2)
-    if not np.any(clustered):
-        return clustered
-    return binary_dilation(clustered, iterations=1)
+    return clustered
+
+
+_STRENGTH_PARAMETERS = {
+    # minimum rejected observations, rejection ratio, point-mask radius/cell
+    "conservative": (6, 0.72, 0.42),
+    "standard": (4, 0.60, 0.55),
+    "aggressive": (3, 0.50, 0.72),
+}
+
+
+def _point_level_dynamic_mask(
+    width: int,
+    height: int,
+    cell_size: int,
+    dynamic_cells: np.ndarray,
+    evidence: list[tuple[np.ndarray, bool]],
+    radius_scale: float,
+) -> np.ndarray:
+    """Rasterize compact circles around inconsistent features in valid clusters.
+
+    This deliberately avoids blacking the complete grid cell.  The old block
+    mask removed visible road/bridge pixels surrounding a moving vehicle.
+    """
+    mask_image = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask_image)
+    radius = max(4, int(round(cell_size * radius_scale)))
+    for point, is_rejected in evidence:
+        if not is_rejected:
+            continue
+        x = min(width - 1, max(0, int(round(float(point[0])))))
+        y = min(height - 1, max(0, int(round(float(point[1])))))
+        grid_x = min(dynamic_cells.shape[1] - 1, x // cell_size)
+        grid_y = min(dynamic_cells.shape[0] - 1, y // cell_size)
+        if not dynamic_cells[grid_y, grid_x]:
+            continue
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
+    return np.asarray(mask_image, dtype=np.uint8) > 0
 
 
 def generate_geometry_masks(
@@ -78,6 +116,9 @@ def generate_geometry_masks(
     static_image_directory: Path,
     *,
     neighbor_span: int = 2,
+    strength: str = "conservative",
+    preview_directory: Path | None = None,
+    report_path: Path | None = None,
 ) -> DynamicMaskSummary:
     """Create COLMAP masks from spatially clustered epipolar-inconsistent matches.
 
@@ -90,6 +131,11 @@ def generate_geometry_masks(
     image_directory = image_directory.resolve()
     mask_directory.mkdir(parents=True, exist_ok=True)
     static_image_directory.mkdir(parents=True, exist_ok=True)
+    if strength not in _STRENGTH_PARAMETERS:
+        raise ValueError(f"未知动态抑制强度：{strength}")
+    minimum_rejections, minimum_ratio, radius_scale = _STRENGTH_PARAMETERS[strength]
+    if preview_directory is not None:
+        preview_directory.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(database_path) as connection:
         # Windows COLMAP may store paths using the active ANSI code page rather
@@ -152,6 +198,8 @@ def generate_geometry_masks(
     masked_images = 0
     masked_pixels = 0
     total_pixels = 0
+    image_reports: list[dict[str, object]] = []
+    static_visibility_values: list[float] = []
     for image_id, relative_name in names.items():
         source = image_directory / Path(relative_name)
         if not source.is_file():
@@ -173,12 +221,20 @@ def generate_geometry_masks(
             if is_rejected:
                 rejected[y, x] += 1
 
-        dynamic_cells = _clustered_dynamic_cells(rejected, observed)
-        dynamic_pixels = np.zeros((height, width), dtype=bool)
-        for grid_y, grid_x in np.argwhere(dynamic_cells):
-            x0 = int(grid_x * cell_size)
-            y0 = int(grid_y * cell_size)
-            dynamic_pixels[y0 : min(height, y0 + cell_size), x0 : min(width, x0 + cell_size)] = True
+        dynamic_cells = _clustered_dynamic_cells(
+            rejected,
+            observed,
+            minimum_rejections=minimum_rejections,
+            minimum_ratio=minimum_ratio,
+        )
+        dynamic_pixels = _point_level_dynamic_mask(
+            width,
+            height,
+            cell_size,
+            dynamic_cells,
+            evidence[image_id],
+            radius_scale,
+        )
 
         static_mask = np.where(dynamic_pixels, 0, 255).astype(np.uint8)
         mask_target = mask_directory / (relative_name + ".png")
@@ -189,6 +245,15 @@ def generate_geometry_masks(
         static_target.parent.mkdir(parents=True, exist_ok=True)
         dynamic_count = int(dynamic_pixels.sum())
         if dynamic_count:
+            if preview_directory is not None:
+                overlay = pixel_data.copy()
+                overlay[dynamic_pixels] = (
+                    overlay[dynamic_pixels].astype(np.float32) * 0.25
+                    + np.array([255.0, 40.0, 40.0]) * 0.75
+                ).astype(np.uint8)
+                preview_target = preview_directory / Path(relative_name)
+                preview_target.parent.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(overlay).save(preview_target, quality=92)
             pixel_data[dynamic_pixels] = 0
             save_options: dict[str, object] = {}
             if static_target.suffix.lower() in {".jpg", ".jpeg"}:
@@ -199,10 +264,58 @@ def generate_geometry_masks(
             shutil.copy2(source, static_target)
         masked_pixels += dynamic_count
         total_pixels += width * height
+        observation_count = len(evidence[image_id])
+        rejection_count = sum(1 for _point, flag in evidence[image_id] if flag)
+        static_visibility = (
+            1.0 - rejection_count / observation_count
+            if observation_count > 0
+            else 1.0
+        )
+        static_visibility = float(np.clip(static_visibility, 0.0, 1.0))
+        static_visibility_values.append(static_visibility)
+        image_reports.append(
+            {
+                "image": relative_name,
+                "geometric_static_visibility": static_visibility,
+                "masked_pixels": dynamic_count,
+                "masked_ratio": dynamic_count / max(width * height, 1),
+                "dynamic_feature_clusters": int(dynamic_cells.sum()),
+            }
+        )
+
+    mean_static_visibility = float(np.mean(static_visibility_values))
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(
+                {
+                    "method": "cross_frame_geometry_consistency",
+                    "strength": strength,
+                    "meaning": (
+                        "geometric_static_visibility is a feature-observation score, "
+                        "not a semantic probability"
+                    ),
+                    "summary": {
+                        "image_count": len(names),
+                        "masked_image_count": masked_images,
+                        "masked_pixel_count": masked_pixels,
+                        "total_pixel_count": total_pixels,
+                        "masked_ratio": masked_pixels / max(total_pixels, 1),
+                        "mean_static_visibility": mean_static_visibility,
+                    },
+                    "images": image_reports,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     return DynamicMaskSummary(
         image_count=len(names),
         masked_image_count=masked_images,
         masked_pixel_count=masked_pixels,
         total_pixel_count=total_pixels,
+        mean_static_visibility=mean_static_visibility,
+        report_path=report_path,
     )

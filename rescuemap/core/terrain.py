@@ -20,6 +20,7 @@ RESHOOT = "RESHOOT"
 FILL_AUTO = "AUTO"
 FILL_FLAT = "FLAT"
 FILL_PLANE = "PLANE"
+FILL_QUADRATIC = "QUADRATIC"
 FILL_CONVEX = "CONVEX"
 FILL_CONCAVE = "CONCAVE"
 
@@ -27,6 +28,7 @@ FILL_STRATEGY_NAMES = {
     FILL_AUTO: "自动二维补全",
     FILL_FLAT: "填平",
     FILL_PLANE: "倾斜平面",
+    FILL_QUADRATIC: "缓变曲面（遮挡恢复）",
     FILL_CONVEX: "上凸",
     FILL_CONCAVE: "下凹",
 }
@@ -35,8 +37,9 @@ FILL_STRATEGY_CODES = {
     FILL_AUTO: 1,
     FILL_FLAT: 2,
     FILL_PLANE: 3,
-    FILL_CONVEX: 4,
-    FILL_CONCAVE: 5,
+    FILL_QUADRATIC: 4,
+    FILL_CONVEX: 5,
+    FILL_CONCAVE: 6,
 }
 
 DECISION_COLORS = {
@@ -183,6 +186,10 @@ class TerrainGrid:
                 self.predicted_height[mask] = float(np.median(reference_height))
             elif strategy == FILL_PLANE:
                 self.predicted_height[mask] = plane
+            elif strategy == FILL_QUADRATIC:
+                self.predicted_height[mask] = self._fit_surrounding_quadratic(
+                    region_id, boundary_mask, mask
+                )
             else:
                 distance_inside = distance_transform_edt(mask)
                 region_distance = distance_inside[mask]
@@ -241,6 +248,43 @@ class TerrainGrid:
             coefficients[0] * (self.x_centers[tx] - center_x)
             + coefficients[1] * (self.y_centers[ty] - center_y)
             + coefficients[2]
+        )
+
+    def _fit_surrounding_quadratic(
+        self,
+        region_id: int,
+        boundary_mask: np.ndarray,
+        target_mask: np.ndarray,
+    ) -> np.ndarray:
+        tx, ty = np.where(target_mask)
+        center_x = float(np.mean(self.x_centers[tx]))
+        center_y = float(np.mean(self.y_centers[ty]))
+        guide_points = self.guide_points_for(region_id)
+        if len(guide_points) >= 6:
+            reference_points = guide_points
+        else:
+            bx, by = np.where(boundary_mask)
+            reference_points = np.column_stack(
+                (
+                    self.x_centers[bx],
+                    self.y_centers[by],
+                    self.observed_height[boundary_mask],
+                )
+            )
+        if len(reference_points) < 6:
+            return self._fit_surrounding_plane(region_id, boundary_mask, target_mask)
+        coefficients = _robust_quadratic_coefficients(
+            reference_points, center_x=center_x, center_y=center_y
+        )
+        dx = self.x_centers[tx] - center_x
+        dy = self.y_centers[ty] - center_y
+        return (
+            coefficients[0] * dx**2
+            + coefficients[1] * dy**2
+            + coefficients[2] * dx * dy
+            + coefficients[3] * dx
+            + coefficients[4] * dy
+            + coefficients[5]
         )
 
     def prediction_polydata(self) -> pv.PolyData:
@@ -382,6 +426,39 @@ def _robust_plane_coefficients(
             design[inliers], points[inliers, 2], rcond=None
         )
     return best_coefficients
+
+
+def _robust_quadratic_coefficients(
+    points: np.ndarray,
+    *,
+    center_x: float,
+    center_y: float,
+) -> np.ndarray:
+    """Fit a slowly varying quadratic surface and reject wrong-layer points."""
+    points = np.asarray(points, dtype=float)
+    dx = points[:, 0] - center_x
+    dy = points[:, 1] - center_y
+    design = np.column_stack((dx**2, dy**2, dx * dy, dx, dy, np.ones(len(points))))
+    coefficients, *_ = np.linalg.lstsq(design, points[:, 2], rcond=None)
+    if len(points) <= 6:
+        return coefficients
+
+    # Two robust refits are enough for an interactive terrain tool. MAD keeps
+    # lower roads, vehicle remnants and vegetation from bending the bridge deck.
+    for _ in range(2):
+        residual = points[:, 2] - design @ coefficients
+        median = float(np.median(residual))
+        absolute_deviation = np.abs(residual - median)
+        mad = float(np.median(absolute_deviation))
+        height_span = max(float(np.ptp(points[:, 2])), 1e-6)
+        threshold = max(3.5 * 1.4826 * mad, 0.01 * height_span, 1e-6)
+        inliers = absolute_deviation <= threshold
+        if int(inliers.sum()) < 6:
+            break
+        coefficients, *_ = np.linalg.lstsq(
+            design[inliers], points[inliers, 2], rcond=None
+        )
+    return coefficients
 
 
 def build_terrain_grid(

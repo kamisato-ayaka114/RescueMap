@@ -59,6 +59,7 @@ from rescuemap.core.terrain import (
     FILL_CONVEX,
     FILL_FLAT,
     FILL_PLANE,
+    FILL_QUADRATIC,
     FILL_STRATEGY_NAMES,
     PREDICTED,
     RESHOOT,
@@ -230,6 +231,21 @@ class MainWindow(QMainWindow):
             "先进行一次低分辨率快速重建，根据相邻照片的几何不一致区域自动生成掩膜，"
             "再进行正式重建。会增加一些处理时间。"
         )
+        self.dynamic_strength_combo = QComboBox()
+        self.dynamic_strength_combo.addItem("保守：优先保留桥面和地形（推荐）", "conservative")
+        self.dynamic_strength_combo.addItem("标准：动态抑制与保留地形平衡", "standard")
+        self.dynamic_strength_combo.addItem("激进：车流很多时使用", "aggressive")
+        self.dynamic_strength_combo.setCurrentIndex(0)
+        self.dynamic_strength_combo.setToolTip(
+            "保守模式只在几何异常特征周围生成紧凑掩膜；激进模式覆盖更宽，"
+            "但可能删除车辆附近的真实路面。"
+        )
+        self.dynamic_strength_combo.setEnabled(
+            self.dynamic_suppression_checkbox.isChecked()
+        )
+        self.dynamic_suppression_checkbox.toggled.connect(
+            self.dynamic_strength_combo.setEnabled
+        )
 
         buttons = QHBoxLayout()
         self.start_reconstruction_button = QPushButton("开始一键重建")
@@ -261,6 +277,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("重建质量："))
         layout.addWidget(self.reconstruction_quality_combo)
         layout.addWidget(self.dynamic_suppression_checkbox)
+        layout.addWidget(QLabel("动态抑制强度："))
+        layout.addWidget(self.dynamic_strength_combo)
         layout.addLayout(buttons)
         layout.addWidget(self.reconstruction_progress)
         layout.addWidget(self.reconstruction_log)
@@ -296,6 +314,7 @@ class MainWindow(QMainWindow):
                 Path(self.project_directory_edit.text().strip()),
                 str(self.reconstruction_quality_combo.currentData()),
                 self.dynamic_suppression_checkbox.isChecked(),
+                str(self.dynamic_strength_combo.currentData()),
             )
             self.settings.setValue("colmap_path", self.colmap_path_edit.text().strip())
             self.statusBar().showMessage(f"正在重建：{workspace}")
@@ -319,6 +338,9 @@ class MainWindow(QMainWindow):
         self.start_reconstruction_button.setEnabled(not running)
         self.cancel_reconstruction_button.setEnabled(running)
         self.dynamic_suppression_checkbox.setEnabled(not running)
+        self.dynamic_strength_combo.setEnabled(
+            not running and self.dynamic_suppression_checkbox.isChecked()
+        )
 
     def _reconstruction_failed(self, message: str) -> None:
         self.reconstruction_progress.setFormat("重建未完成")
@@ -334,7 +356,8 @@ class MainWindow(QMainWindow):
         self.reconstruction_progress.setFormat("重建与地图加载完成")
         self.statusBar().showMessage(f"重建完成：{result.workspace}")
         dynamic_message = (
-            "已执行跨帧几何动态干扰抑制；掩膜和静态化照片保存在本次工作区。\n\n"
+                "已执行精细跨帧几何动态干扰抑制；掩膜、红色叠加预览和逐图统计"
+                "保存在本次工作区。\n\n"
             if self.dynamic_suppression_checkbox.isChecked()
             else ""
         )
@@ -553,7 +576,14 @@ class MainWindow(QMainWindow):
         self.region_summary_label = QLabel("尚未生成预测区域")
         self.region_summary_label.setWordWrap(True)
         self.fill_strategy_combo = QComboBox()
-        for strategy in (FILL_AUTO, FILL_FLAT, FILL_PLANE, FILL_CONVEX, FILL_CONCAVE):
+        for strategy in (
+            FILL_AUTO,
+            FILL_FLAT,
+            FILL_PLANE,
+            FILL_QUADRATIC,
+            FILL_CONVEX,
+            FILL_CONCAVE,
+        ):
             self.fill_strategy_combo.addItem(FILL_STRATEGY_NAMES[strategy], strategy)
         apply_strategy_button = QPushButton("将填充策略应用到当前区域")
         apply_strategy_button.clicked.connect(self.apply_fill_strategy_to_current)
@@ -1389,9 +1419,15 @@ class MainWindow(QMainWindow):
         snapped_points = np.asarray(self.scene.original.points)[np.asarray(indices)]
         try:
             self.terrain_grid.set_guide_points(region_id, snapped_points)
-            self.terrain_grid.apply_fill_strategy(region_id, FILL_PLANE)
+            requested_strategy = str(self.fill_strategy_combo.currentData())
+            fitted_strategy = (
+                FILL_QUADRATIC
+                if requested_strategy == FILL_QUADRATIC and len(snapped_points) >= 6
+                else FILL_PLANE
+            )
+            self.terrain_grid.apply_fill_strategy(region_id, fitted_strategy)
             self.fill_strategy_combo.setCurrentIndex(
-                self.fill_strategy_combo.findData(FILL_PLANE)
+                self.fill_strategy_combo.findData(fitted_strategy)
             )
             self.terrain_mesh = None
             self.terrain_mesh_settings = None
@@ -1401,7 +1437,8 @@ class MainWindow(QMainWindow):
             self._update_region_summary()
             self._show_scene()
             self.statusBar().showMessage(
-                f"区域{region_id}已使用{len(snapped_points)}个参考点拟合倾斜平面"
+                f"区域{region_id}已使用{len(snapped_points)}个参考点拟合"
+                f"{FILL_STRATEGY_NAMES[fitted_strategy]}"
             )
         except Exception as exc:
             QMessageBox.critical(self, "参考点拟合失败", str(exc))
