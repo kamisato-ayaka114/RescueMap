@@ -242,8 +242,8 @@ class MainWindow(QMainWindow):
         self.dynamic_strength_combo.addItem("激进：动态物体较多时使用", "aggressive")
         self.dynamic_strength_combo.setCurrentIndex(0)
         self.dynamic_strength_combo.setToolTip(
-            "保守模式只在几何异常特征周围生成紧凑掩膜；激进模式覆盖更宽，"
-            "但可能删除动态物体附近仍然可见的真实地形。"
+            "先将跨帧几何异常作为动态种子，再依据图像边缘扩张为完整区域。"
+            "保守模式的扩张范围较小；激进模式覆盖更宽，但误删风险也更高。"
         )
         self.dynamic_strength_combo.setEnabled(
             self.dynamic_suppression_checkbox.isChecked()

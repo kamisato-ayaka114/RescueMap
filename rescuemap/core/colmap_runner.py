@@ -431,7 +431,8 @@ class ColmapRunner(QObject):
             f"{summary.masked_image_count}/{summary.image_count} 张照片检测到高置信动态区域，"
             f"屏蔽像素占比 {summary.masked_ratio * 100:.2f}%\n"
             f"平均几何静态可见率 {summary.mean_static_visibility * 100:.2f}%\n"
-            "掩膜预览与逐图统计已经保存；不确定区域继续保留。\n"
+            "已使用几何种子引导的边缘约束区域扩张；"
+            "掩膜预览与逐图统计已经保存，不确定区域继续保留。\n"
         )
 
     def _process_error(self, error) -> None:

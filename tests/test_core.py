@@ -23,6 +23,7 @@ from rescuemap.core.candidate_validation import (
 )
 from rescuemap.core.dynamic_mask import (
     _clustered_dynamic_cells,
+    _edge_aware_region_mask,
     _point_level_dynamic_mask,
 )
 from rescuemap.core.terrain import (
@@ -42,6 +43,25 @@ from rescuemap.core.terrain_mesh import build_terrain_mesh
 
 
 class DynamicSuppressionTests(unittest.TestCase):
+    def test_edge_aware_growth_recovers_object_area_without_flooding_background(self):
+        rgb = np.full((120, 160, 3), 155, dtype=np.uint8)
+        rgb[35:85, 55:110] = np.array([190, 35, 35], dtype=np.uint8)
+        seeds = np.zeros((120, 160), dtype=bool)
+        seeds[55:65, 75:85] = True
+        cells = np.zeros((3, 4), dtype=bool)
+        cells[1, 1:3] = True
+
+        grown = _edge_aware_region_mask(
+            rgb, seeds, cells, 40, strength="standard", max_analysis_side=240
+        )
+
+        object_area = np.zeros_like(grown)
+        object_area[35:85, 55:110] = True
+        object_coverage = np.count_nonzero(grown & object_area) / object_area.sum()
+        background_leak = np.count_nonzero(grown & ~object_area) / grown.size
+        self.assertGreater(object_coverage, 0.65)
+        self.assertLess(background_leak, 0.20)
+
     def test_only_clustered_rejections_expand_into_mask_cells(self):
         rejected = np.zeros((7, 7), dtype=np.int32)
         observed = np.zeros_like(rejected)

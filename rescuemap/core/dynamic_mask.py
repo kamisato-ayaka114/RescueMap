@@ -8,7 +8,14 @@ import sqlite3
 
 import numpy as np
 from PIL import Image, ImageDraw
-from scipy.ndimage import convolve
+from scipy.ndimage import (
+    binary_closing,
+    binary_dilation,
+    binary_fill_holes,
+    binary_propagation,
+    convolve,
+    sobel,
+)
 
 
 MAX_IMAGE_ID = 2_147_483_647
@@ -79,6 +86,16 @@ _STRENGTH_PARAMETERS = {
     "aggressive": (3, 0.50, 0.72),
 }
 
+# Maximum spatial expansion relative to a geometry grid cell and the edge
+# percentile that region growing may cross.  The dynamic decision still comes
+# from multi-view geometry; image colour is only used to recover the complete
+# support of the object around those high-confidence seeds.
+_REGION_GROW_PARAMETERS = {
+    "conservative": (0.20, 0.68),
+    "standard": (0.38, 0.78),
+    "aggressive": (0.58, 0.86),
+}
+
 
 def _point_level_dynamic_mask(
     width: int,
@@ -107,6 +124,87 @@ def _point_level_dynamic_mask(
             continue
         draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
     return np.asarray(mask_image, dtype=np.uint8) > 0
+
+
+def _edge_aware_region_mask(
+    rgb: np.ndarray,
+    seed_mask: np.ndarray,
+    dynamic_cells: np.ndarray,
+    cell_size: int,
+    *,
+    strength: str,
+    max_analysis_side: int = 1200,
+) -> np.ndarray:
+    """Expand geometric seeds inside an edge-bounded spatial envelope.
+
+    Processing a reduced image keeps this stage practical on integrated-GPU
+    computers (the implementation itself is CPU based).  Strong image edges
+    act as barriers, while the geometry cells prevent propagation into distant
+    static terrain when the foreground and background have similar colours.
+    """
+    height, width = seed_mask.shape
+    if not np.any(seed_mask) or not np.any(dynamic_cells):
+        return seed_mask.copy()
+    margin_scale, edge_percentile = _REGION_GROW_PARAMETERS[strength]
+    resize_scale = min(1.0, max_analysis_side / max(width, height))
+    analysis_width = max(8, int(round(width * resize_scale)))
+    analysis_height = max(8, int(round(height * resize_scale)))
+    rgb_small = np.asarray(
+        Image.fromarray(rgb).resize(
+            (analysis_width, analysis_height), Image.Resampling.BILINEAR
+        ),
+        dtype=np.float32,
+    ) / 255.0
+    seed_small = np.asarray(
+        Image.fromarray(seed_mask.astype(np.uint8) * 255).resize(
+            (analysis_width, analysis_height), Image.Resampling.NEAREST
+        )
+    ) > 0
+
+    scale_x = analysis_width / width
+    scale_y = analysis_height / height
+    envelope = np.zeros((analysis_height, analysis_width), dtype=bool)
+    for grid_y, grid_x in np.argwhere(dynamic_cells):
+        x0 = max(0, int(np.floor(grid_x * cell_size * scale_x)))
+        x1 = min(analysis_width, int(np.ceil((grid_x + 1) * cell_size * scale_x)))
+        y0 = max(0, int(np.floor(grid_y * cell_size * scale_y)))
+        y1 = min(analysis_height, int(np.ceil((grid_y + 1) * cell_size * scale_y)))
+        envelope[y0:y1, x0:x1] = True
+    cell_small = max(2.0, cell_size * 0.5 * (scale_x + scale_y))
+    margin = max(1, int(round(cell_small * margin_scale)))
+    envelope = binary_dilation(envelope, iterations=margin)
+    envelope = binary_closing(envelope, iterations=max(1, margin // 3))
+
+    gray = (
+        0.299 * rgb_small[:, :, 0]
+        + 0.587 * rgb_small[:, :, 1]
+        + 0.114 * rgb_small[:, :, 2]
+    )
+    gradient = np.hypot(sobel(gray, axis=0), sobel(gray, axis=1)) / 8.0
+    local_gradient = gradient[envelope]
+    if local_gradient.size:
+        edge_limit = max(0.035, float(np.quantile(local_gradient, edge_percentile)))
+    else:
+        edge_limit = 0.035
+    barriers = gradient > min(edge_limit, 0.22)
+
+    # A seed may lie exactly on an object edge.  Widen it slightly so that the
+    # propagation can enter both adjacent interiors, while the outer envelope
+    # still provides a strict upper bound.
+    seed_core = binary_dilation(seed_small, iterations=max(1, int(cell_small * 0.06)))
+    seed_core &= envelope
+    allowed = envelope & ~barriers
+    grown = binary_propagation(seed_core, mask=(allowed | seed_core))
+    grown = binary_closing(grown, iterations=max(1, int(cell_small * 0.04)))
+    grown = binary_fill_holes(grown) & envelope
+    grown |= seed_small
+
+    restored = np.asarray(
+        Image.fromarray(grown.astype(np.uint8) * 255).resize(
+            (width, height), Image.Resampling.NEAREST
+        )
+    ) > 0
+    return restored | seed_mask
 
 
 def generate_geometry_masks(
@@ -227,13 +325,20 @@ def generate_geometry_masks(
             minimum_rejections=minimum_rejections,
             minimum_ratio=minimum_ratio,
         )
-        dynamic_pixels = _point_level_dynamic_mask(
+        seed_pixels = _point_level_dynamic_mask(
             width,
             height,
             cell_size,
             dynamic_cells,
             evidence[image_id],
             radius_scale,
+        )
+        dynamic_pixels = _edge_aware_region_mask(
+            pixel_data,
+            seed_pixels,
+            dynamic_cells,
+            cell_size,
+            strength=strength,
         )
 
         static_mask = np.where(dynamic_pixels, 0, 255).astype(np.uint8)
@@ -279,6 +384,10 @@ def generate_geometry_masks(
                 "geometric_static_visibility": static_visibility,
                 "masked_pixels": dynamic_count,
                 "masked_ratio": dynamic_count / max(width * height, 1),
+                "geometric_seed_pixels": int(seed_pixels.sum()),
+                "region_expansion_pixels": max(
+                    0, dynamic_count - int(seed_pixels.sum())
+                ),
                 "dynamic_feature_clusters": int(dynamic_cells.sum()),
             }
         )
@@ -289,7 +398,7 @@ def generate_geometry_masks(
         report_path.write_text(
             json.dumps(
                 {
-                    "method": "cross_frame_geometry_consistency",
+                    "method": "geometry_seeded_edge_aware_region_expansion",
                     "strength": strength,
                     "meaning": (
                         "geometric_static_visibility is a feature-observation score, "
