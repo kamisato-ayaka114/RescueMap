@@ -237,13 +237,13 @@ class MainWindow(QMainWindow):
             "再进行正式重建。会增加一些处理时间。"
         )
         self.dynamic_strength_combo = QComboBox()
-        self.dynamic_strength_combo.addItem("保守：优先保留桥面和地形（推荐）", "conservative")
+        self.dynamic_strength_combo.addItem("保守：优先保留静态地形（推荐）", "conservative")
         self.dynamic_strength_combo.addItem("标准：动态抑制与保留地形平衡", "standard")
-        self.dynamic_strength_combo.addItem("激进：车流很多时使用", "aggressive")
+        self.dynamic_strength_combo.addItem("激进：动态物体较多时使用", "aggressive")
         self.dynamic_strength_combo.setCurrentIndex(0)
         self.dynamic_strength_combo.setToolTip(
             "保守模式只在几何异常特征周围生成紧凑掩膜；激进模式覆盖更宽，"
-            "但可能删除车辆附近的真实路面。"
+            "但可能删除动态物体附近仍然可见的真实地形。"
         )
         self.dynamic_strength_combo.setEnabled(
             self.dynamic_suppression_checkbox.isChecked()
