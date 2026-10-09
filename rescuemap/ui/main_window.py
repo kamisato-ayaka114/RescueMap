@@ -44,6 +44,10 @@ from rescuemap.core.calibration import (
     ground_alignment_transform,
     uniform_scale_transform,
 )
+from rescuemap.core.candidate_validation import (
+    CandidateValidationResult,
+    evaluate_region_candidates,
+)
 from rescuemap.core.colmap_runner import (
     ColmapRunner,
     ReconstructionResult,
@@ -110,6 +114,7 @@ class MainWindow(QMainWindow):
         self.terrain_roi: tuple[float, float, float, float] | None = None
         self.terrain_grid: TerrainGrid | None = None
         self.terrain_settings: dict[str, float | int] | None = None
+        self.candidate_results: dict[int, CandidateValidationResult] = {}
         self.terrain_mesh: pv.PolyData | None = None
         self.terrain_mesh_settings: dict[str, float] | None = None
         self.terrain_mesh_path: Path | None = None
@@ -575,6 +580,8 @@ class MainWindow(QMainWindow):
         self.region_list.itemChanged.connect(self._draw_checked_regions_highlight)
         self.region_summary_label = QLabel("尚未生成预测区域")
         self.region_summary_label.setWordWrap(True)
+        self.candidate_validation_label = QLabel("尚未评价多个候选地形")
+        self.candidate_validation_label.setWordWrap(True)
         self.fill_strategy_combo = QComboBox()
         for strategy in (
             FILL_AUTO,
@@ -587,6 +594,10 @@ class MainWindow(QMainWindow):
             self.fill_strategy_combo.addItem(FILL_STRATEGY_NAMES[strategy], strategy)
         apply_strategy_button = QPushButton("将填充策略应用到当前区域")
         apply_strategy_button.clicked.connect(self.apply_fill_strategy_to_current)
+        evaluate_candidates_button = QPushButton("评价三个候选地形（几何＋图像）")
+        evaluate_candidates_button.clicked.connect(self.evaluate_current_candidates)
+        apply_recommended_button = QPushButton("应用软件推荐候选")
+        apply_recommended_button.clicked.connect(self.apply_recommended_candidate)
         apply_batch_strategy_button = QPushButton("将填充策略应用到勾选区域")
         apply_batch_strategy_button.clicked.connect(self.apply_fill_strategy_to_checked)
         decision_row = QHBoxLayout()
@@ -632,6 +643,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(box_select_button)
         layout.addWidget(finish_box_select_button)
         layout.addWidget(self.region_summary_label)
+        layout.addWidget(evaluate_candidates_button)
+        layout.addWidget(apply_recommended_button)
+        layout.addWidget(self.candidate_validation_label)
         layout.addWidget(guide_points_button)
         layout.addWidget(manual_fill_box_button)
         layout.addWidget(QLabel("选择要应用的人工填充策略："))
@@ -972,6 +986,7 @@ class MainWindow(QMainWindow):
         self.color_mode = "original"
         self.terrain_grid = None
         self.terrain_settings = None
+        self.candidate_results.clear()
         self.terrain_mesh = None
         self.terrain_mesh_settings = None
         self.terrain_mesh_path = None
@@ -982,6 +997,7 @@ class MainWindow(QMainWindow):
         self.region_combo.clear()
         self.region_list.clear()
         self.region_summary_label.setText("尚未生成预测区域")
+        self.candidate_validation_label.setText("尚未评价多个候选地形")
         self.color_legend_widget.hide()
         if clear_roi:
             self.terrain_roi = None
@@ -1254,6 +1270,7 @@ class MainWindow(QMainWindow):
         try:
             bounds = self._rectangle_xy_bounds(selection.viewport, reference_z)
             count = self.terrain_grid.add_manual_fill_rectangle(region_id, bounds)
+            self.candidate_results.pop(region_id, None)
             self.terrain_grid.apply_fill_strategy(
                 region_id,
                 self.manual_fill_strategy,
@@ -1419,6 +1436,7 @@ class MainWindow(QMainWindow):
         snapped_points = np.asarray(self.scene.original.points)[np.asarray(indices)]
         try:
             self.terrain_grid.set_guide_points(region_id, snapped_points)
+            self.candidate_results.pop(region_id, None)
             requested_strategy = str(self.fill_strategy_combo.currentData())
             fitted_strategy = (
                 FILL_QUADRATIC
@@ -1452,6 +1470,7 @@ class MainWindow(QMainWindow):
         self.terrain_roi = (xmin, xmax, ymin, ymax)
         self.terrain_grid = None
         self.terrain_settings = None
+        self.candidate_results.clear()
         self.terrain_mesh = None
         self.terrain_mesh_settings = None
         self._invalidate_path_planning()
@@ -1504,6 +1523,7 @@ class MainWindow(QMainWindow):
                 max_prediction_distance_cells=4.0,
                 algorithm=algorithm,
             )
+            self.candidate_results.clear()
             self.terrain_settings = {
                 "cell_size": cell_size,
                 "min_points": 3,
@@ -1774,6 +1794,7 @@ class MainWindow(QMainWindow):
         region_id = self._current_region_id()
         if self.terrain_grid is None or region_id is None:
             self.region_summary_label.setText("尚未生成预测区域")
+            self.candidate_validation_label.setText("尚未评价多个候选地形")
             self._draw_selected_region_highlight()
             self._draw_region_guide_points()
             return
@@ -1790,8 +1811,87 @@ class MainWindow(QMainWindow):
             f"填充策略：{FILL_STRATEGY_NAMES[strategy]}{parameter_text}\n"
             f"人工状态：{info['decision']}"
         )
+        result = self.candidate_results.get(region_id)
+        if result is None:
+            self.candidate_validation_label.setText("尚未评价多个候选地形")
+        else:
+            lines = [result.context_message]
+            for score in result.scores:
+                photo_text = (
+                    f"{score.photometric_score:.3f}"
+                    if score.photometric_score is not None
+                    else "无证据"
+                )
+                lines.append(
+                    f"{FILL_STRATEGY_NAMES[score.strategy]}：总分 {score.final_confidence:.3f}，"
+                    f"几何 {score.geometry_score:.3f}，模型一致 {score.model_agreement_score:.3f}，"
+                    f"纹理 {score.texture_strength:.3f}，图像 {photo_text}，"
+                    f"有效视角 {score.effective_views}"
+                )
+            lines.append(
+                f"推荐：{FILL_STRATEGY_NAMES[result.recommended_strategy]}"
+                + ("（已使用图像证据）" if result.image_evidence_available else "（仅几何评价）")
+            )
+            self.candidate_validation_label.setText("\n".join(lines))
         self._draw_selected_region_highlight()
         self._draw_region_guide_points()
+
+    def evaluate_current_candidates(self) -> None:
+        region_id = self._current_region_id()
+        if self.scene is None or self.terrain_grid is None or region_id is None:
+            QMessageBox.information(self, "没有预测区域", "请先生成并选择一个预测区域。")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.statusBar().showMessage("正在生成三个候选曲面并进行反投影评价……")
+        QApplication.processEvents()
+        try:
+            result = evaluate_region_candidates(
+                self.terrain_grid,
+                region_id,
+                model_path=self.scene.path,
+                calibration_matrix=self.scene.calibration_matrix,
+            )
+            self.candidate_results[region_id] = result
+            self._update_region_summary()
+            self.statusBar().showMessage(
+                f"区域{region_id}评价完成，推荐“"
+                f"{FILL_STRATEGY_NAMES[result.recommended_strategy]}”"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "候选地形评价失败", str(exc))
+            self.statusBar().showMessage("候选地形评价失败")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def apply_recommended_candidate(self) -> None:
+        region_id = self._current_region_id()
+        if self.terrain_grid is None or region_id is None:
+            QMessageBox.information(self, "没有预测区域", "请先生成并选择一个预测区域。")
+            return
+        result = self.candidate_results.get(region_id)
+        if result is None:
+            QMessageBox.information(
+                self, "尚未评价", "请先点击“评价三个候选地形（几何＋图像）”。"
+            )
+            return
+        try:
+            strategy = result.recommended_strategy
+            self.terrain_grid.apply_fill_strategy(region_id, strategy)
+            combo_index = self.fill_strategy_combo.findData(strategy)
+            if combo_index >= 0:
+                self.fill_strategy_combo.setCurrentIndex(combo_index)
+            self.terrain_mesh = None
+            self.terrain_mesh_settings = None
+            self._invalidate_path_planning()
+            self.mesh_summary_label.setText("推荐候选已应用，请重新生成地形网格")
+            self._refresh_region_list_text()
+            self._update_region_summary()
+            self._show_scene()
+            self.statusBar().showMessage(
+                f"已对区域{region_id}应用“{FILL_STRATEGY_NAMES[strategy]}”"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "应用推荐候选失败", str(exc))
 
     def _strategy_amplitude(self, strategy: str) -> float | None:
         if strategy not in (FILL_CONVEX, FILL_CONCAVE):
@@ -2398,6 +2498,7 @@ class MainWindow(QMainWindow):
             self.color_mode = "original"
             self.terrain_grid = None
             self.terrain_settings = None
+            self.candidate_results.clear()
             self.terrain_mesh = None
             self.terrain_mesh_settings = None
             self.terrain_mesh_path = None

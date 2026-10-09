@@ -1,9 +1,11 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import struct
 
 import numpy as np
 import pyvista as pv
+from PIL import Image
 from scipy.ndimage import distance_transform_edt
 
 from rescuemap.core.calibration import (
@@ -11,6 +13,14 @@ from rescuemap.core.calibration import (
     uniform_scale_transform,
 )
 from rescuemap.core.colmap_runner import build_colmap_stages
+from rescuemap.core.candidate_validation import (
+    ColmapCamera,
+    ColmapImage,
+    _image_measurements,
+    evaluate_region_candidates,
+    project_points,
+    read_colmap_binary_model,
+)
 from rescuemap.core.dynamic_mask import (
     _clustered_dynamic_cells,
     _point_level_dynamic_mask,
@@ -57,6 +67,98 @@ class DynamicSuppressionTests(unittest.TestCase):
         self.assertTrue(mask[15, 15])
         self.assertFalse(mask[10, 10])
         self.assertLess(int(mask.sum()), 10 * 10)
+
+
+class CandidateValidationTests(unittest.TestCase):
+    def test_dynamic_black_pixels_are_not_counted_as_image_evidence(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
+            root = Path(temporary_directory)
+            black = np.zeros((32, 32), dtype=np.uint8)
+            gradient = np.tile(np.arange(32, dtype=np.uint8) * 8, (32, 1))
+            Image.fromarray(black).save(root / "masked.png")
+            Image.fromarray(gradient).save(root / "valid.png")
+            camera = ColmapCamera(
+                1, "PINHOLE", 32, 32, np.array([20.0, 20.0, 16.0, 16.0])
+            )
+            images = [
+                ColmapImage(1, 1, "masked.png", np.eye(3), np.zeros(3)),
+                ColmapImage(2, 1, "valid.png", np.eye(3), np.zeros(3)),
+            ]
+            points = np.array(
+                [[-0.5, -0.5, 5.0], [0.5, -0.5, 5.0],
+                 [-0.5, 0.5, 5.0], [0.5, 0.5, 5.0]]
+            )
+
+            _, photometric, effective_views = _image_measurements(
+                points, {1: camera}, images, root
+            )
+
+            self.assertEqual(effective_views, 1)
+            self.assertIsNone(photometric)
+
+    def test_pinhole_projection_uses_colmap_world_to_camera_pose(self):
+        camera = ColmapCamera(
+            1, "PINHOLE", 100, 100, np.array([50.0, 50.0, 50.0, 50.0])
+        )
+        image = ColmapImage(
+            1, 1, "frame.jpg", np.eye(3), np.zeros(3)
+        )
+
+        uv, depth = project_points(
+            np.array([[0.0, 0.0, 5.0], [1.0, 0.0, 5.0]]), camera, image
+        )
+
+        np.testing.assert_allclose(uv, [[50.0, 50.0], [60.0, 50.0]])
+        np.testing.assert_allclose(depth, [5.0, 5.0])
+
+    def test_colmap_binary_camera_and_image_model_can_be_read(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
+            root = Path(temporary_directory)
+            with (root / "cameras.bin").open("wb") as stream:
+                stream.write(struct.pack("<Q", 1))
+                stream.write(struct.pack("<iiQQ4d", 1, 1, 100, 80,
+                                         50.0, 50.0, 50.0, 40.0))
+            with (root / "images.bin").open("wb") as stream:
+                stream.write(struct.pack("<Q", 1))
+                stream.write(struct.pack("<i4d3di", 7, 1.0, 0.0, 0.0, 0.0,
+                                         0.0, 0.0, 0.0, 1))
+                stream.write("测试.jpg".encode("utf-8") + b"\x00")
+                stream.write(struct.pack("<Q", 0))
+
+            cameras, images = read_colmap_binary_model(root)
+
+            self.assertEqual(cameras[1].model, "PINHOLE")
+            self.assertEqual(images[0].name, "测试.jpg")
+            np.testing.assert_allclose(images[0].rotation, np.eye(3))
+
+    def test_three_candidates_receive_geometry_scores_without_images(self):
+        x, y = np.meshgrid(
+            np.linspace(0.0, 10.0, 31),
+            np.linspace(0.0, 10.0, 31),
+            indexing="ij",
+        )
+        z = 2.0 + 0.1 * x
+        keep = ~((x > 3.0) & (x < 7.0) & (y > 3.0) & (y < 7.0))
+        grid = build_terrain_grid(
+            np.c_[x[keep], y[keep], z[keep]],
+            bounds_xy=(0.0, 10.0, 0.0, 10.0),
+            cell_size=1.0 / 3.0,
+            min_points=1,
+            algorithm="harmonic",
+        )
+
+        result = evaluate_region_candidates(
+            grid,
+            1,
+            model_path=Path("missing/dense/fused.ply"),
+            calibration_matrix=np.eye(4),
+        )
+
+        self.assertEqual(len(result.scores), 3)
+        self.assertFalse(result.image_evidence_available)
+        self.assertIn(result.recommended_strategy, {FILL_AUTO, FILL_PLANE, FILL_QUADRATIC})
+        self.assertTrue(all(0.0 <= score.final_confidence <= 1.0
+                            for score in result.scores))
 
     def test_two_pass_pipeline_uses_generated_static_images_and_masks(self):
         with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
