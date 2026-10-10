@@ -306,6 +306,7 @@ class ColmapRunner(QObject):
         self._cancelled = False
         self._active = False
         self._preprocess_only = False
+        self._resume_from_static = False
         self._background_thread: QThread | None = None
         self._background_worker: _FunctionWorker | None = None
         self._background_failure_prefix = "照片处理失败"
@@ -361,6 +362,7 @@ class ColmapRunner(QObject):
         self._cancelled = False
         self._active = True
         self._preprocess_only = preprocess_only
+        self._resume_from_static = False
         self.log_received.emit(
             f"COLMAP：{executable}\n照片：{image_directory}\n"
             f"照片数量：{image_count}\n本次工作区：{workspace}\n"
@@ -372,6 +374,74 @@ class ColmapRunner(QObject):
             )
             + f"夜间统一增强：{'开启' if low_light_enhancement else '关闭'}\n"
             + f"任务类型：{'仅生成最终静态图片数据集' if preprocess_only else '完整三维重建'}\n"
+        )
+        self.running_changed.emit(True)
+        self._start_next_stage()
+        return workspace
+
+    def resume_preprocessing(
+        self,
+        colmap_path: Path,
+        image_directory: Path,
+        workspace: Path,
+        start_kind: str,
+    ) -> Path:
+        """Resume an existing preprocessing workspace at a chosen stage."""
+        if self.is_running:
+            raise RuntimeError("已有重建任务正在运行。")
+        executable = resolve_colmap_executable(colmap_path)
+        image_directory = image_directory.expanduser().resolve()
+        workspace = workspace.expanduser().resolve()
+        if not image_directory.is_dir():
+            raise FileNotFoundError(f"找不到原始照片目录：{image_directory}")
+        if not workspace.is_dir():
+            raise FileNotFoundError(f"找不到已有预处理工程：{workspace}")
+        processing_directory = (
+            workspace / "enhanced_images"
+            if (workspace / "enhanced_images").is_dir()
+            else image_directory
+        )
+        stages = build_colmap_stages(
+            executable,
+            image_directory,
+            workspace,
+            "fast",
+            dynamic_suppression=True,
+            low_light_enhancement=False,
+            preprocess_only=True,
+        )
+        start_index = next(
+            (index for index, stage in enumerate(stages) if stage.kind == start_kind),
+            None,
+        )
+        if start_index is None:
+            raise ValueError(f"未知的继续步骤：{start_kind}")
+        if start_kind != "generate_masks" and not (workspace / "dynamic_masks").is_dir():
+            raise FileNotFoundError("该工程尚未生成 dynamic_masks，不能从所选步骤继续。")
+        if start_kind in {"review_completed", "complete_final", "review_final_static"} \
+                and not (workspace / "static_images").is_dir():
+            raise FileNotFoundError("该工程尚未生成 static_images，不能从所选步骤继续。")
+        if start_kind in {"generate_masks", "complete_backgrounds", "complete_final"} \
+                and not (workspace / "dynamic_preview" / "database.db").is_file():
+            raise FileNotFoundError("该工程缺少快速重建数据库，无法继续自动处理。")
+
+        self._workspace = workspace
+        self._image_directory = image_directory
+        self._processing_image_directory = processing_directory
+        self._dynamic_strength = "standard"
+        self._stages = stages
+        self._stage_index = start_index - 1
+        self._cancelled = False
+        self._active = True
+        self._preprocess_only = True
+        self._resume_from_static = (
+            start_kind != "generate_masks" and (workspace / "static_images").is_dir()
+        )
+        self.log_received.emit(
+            f"继续已有照片预处理工程：{workspace}\n"
+            f"原始照片：{image_directory}\n"
+            f"当前处理照片：{processing_directory}\n"
+            f"从步骤“{stages[start_index].title}”继续。\n"
         )
         self.running_changed.emit(True)
         self._start_next_stage()
@@ -429,7 +499,11 @@ class ColmapRunner(QObject):
             self._stage_index = review_index - 1
             self.log_received.emit("返回第二次动态框复核，可继续修正后重新生成最终数据集。\n")
         else:
-            self.log_received.emit("最终静态图片数据集已确认，开始正式三维重建。\n")
+            self.log_received.emit(
+                "最终静态图片数据集已确认，保存并返回主界面。\n"
+                if self._preprocess_only
+                else "最终静态图片数据集已确认，开始正式三维重建。\n"
+            )
         QTimer.singleShot(0, self._start_next_stage)
 
     def _switch_processing_images(self, directory: Path) -> None:
@@ -658,7 +732,8 @@ class ColmapRunner(QObject):
         # originals would silently put the removed moving objects back.
         source_directory = (
             self._workspace / "static_images"
-            if final else self._processing_image_directory
+            if final or self._resume_from_static
+            else self._processing_image_directory
         )
         completion = complete_dynamic_backgrounds(
             self._workspace / "dynamic_preview" / "database.db",
@@ -678,6 +753,9 @@ class ColmapRunner(QObject):
             f"补全 {completion.completed_pixels}/{completion.dynamic_pixels} 个动态像素，"
             f"其中强纹理延伸 {completion.strong_texture_pixels}，"
             f"弱纹理投影验证 {completion.weak_texture_pixels}；"
+            f"周围纹理延伸 {completion.local_texture_pixels}，"
+            f"小空洞稳健填充 {completion.small_hole_pixels}；"
+            f"近景地面优先填充 {completion.near_side_pixels}；"
             f"其余 {completion.unresolved_pixels} 个像素保持屏蔽。\n"
         )
 

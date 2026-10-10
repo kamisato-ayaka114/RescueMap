@@ -174,7 +174,8 @@ class DynamicReviewDialog(QDialog):
         help_label = QLabel(
             f"算法已在 {detected_count}/{len(self.paths)} 张图片中生成初始动态候选框。"
             "红框是算法初标或人工补充；左键拖框添加，右键单击框内删除。\n"
-            "左侧“未检出”只表示算法没有足够证据，仍需人工检查。切换图片时自动保存。"
+            "左侧“未检出”只表示算法没有足够证据，仍需人工检查。切换图片时自动保存。\n"
+            "保存继续后，掩膜、带框图片和框坐标会留在本次工程中，下次可直接续跑。"
         )
         help_label.setWordWrap(True)
         help_label.setStyleSheet("background:#fff3b0;color:#202020;padding:8px;border:1px solid #d6a800;")

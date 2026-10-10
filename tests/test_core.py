@@ -13,6 +13,8 @@ from rescuemap.core.calibration import (
     uniform_scale_transform,
 )
 from rescuemap.core.background_completion import (
+    _directional_boundary_fill,
+    _near_side_ground_fill,
     _normalised_correlation,
     _project_homography,
     _robust_homography,
@@ -49,6 +51,33 @@ from rescuemap.core.terrain_mesh import build_terrain_mesh
 
 
 class DynamicSuppressionTests(unittest.TestCase):
+    def test_directional_boundary_fill_uses_surrounding_texture(self):
+        height, width = 50, 70
+        x = np.arange(width, dtype=np.uint8)[None, :]
+        rgb = np.repeat(np.repeat(x[:, :, None], height, axis=0), 3, axis=2)
+        hole = np.zeros((height, width), dtype=bool)
+        hole[15:35, 25:45] = True
+
+        values = _directional_boundary_fill(rgb, hole)
+
+        self.assertEqual(values.shape, (400, 3))
+        self.assertGreater(float(values.mean()), 20.0)
+        self.assertLess(float(values.mean()), 50.0)
+        self.assertGreater(float(values.std()), 1.0)
+
+    def test_near_side_fill_prefers_lower_ground_over_upper_sky(self):
+        rgb = np.empty((80, 100, 3), dtype=np.uint8)
+        rgb[:40] = np.array([20, 45, 135], dtype=np.uint8)
+        rgb[40:] = np.array([115, 90, 65], dtype=np.uint8)
+        hole = np.zeros((80, 100), dtype=bool)
+        hole[28:58, 35:65] = True
+
+        values = _near_side_ground_fill(rgb, hole)
+
+        mean = values.mean(axis=0)
+        self.assertGreater(mean[0], mean[2])
+        self.assertGreater(mean[0], 80.0)
+
     def test_low_light_enhancement_preserves_structure_and_brightens_dark_detail(self):
         with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
             root = Path(temporary_directory)

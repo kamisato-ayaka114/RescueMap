@@ -334,6 +334,20 @@ class MainWindow(QMainWindow):
         self.view_static_dataset_button = QPushButton("再次查看最近的静态数据集")
         self.view_static_dataset_button.setEnabled(False)
         self.view_static_dataset_button.clicked.connect(self._view_last_static_dataset)
+        resume_label = QLabel("复用已有预处理成果（可直接从中间步骤继续）：")
+        self.resume_workspace_edit = QLineEdit()
+        self.resume_workspace_edit.setPlaceholderText("选择 reconstruction_日期_时间 工程目录")
+        resume_workspace_button = QPushButton("选择已有预处理工程")
+        resume_workspace_button.clicked.connect(self.choose_resume_workspace)
+        self.resume_stage_combo = QComboBox()
+        self.resume_stage_combo.addItem("重新执行自动动态检测", "generate_masks")
+        self.resume_stage_combo.addItem("从第一次人工复核动态框开始", "review_initial")
+        self.resume_stage_combo.addItem("从首次背景恢复开始", "complete_backgrounds")
+        self.resume_stage_combo.addItem("从第二次人工复核静态图片开始", "review_completed")
+        self.resume_stage_combo.addItem("从最终静态数据生成开始", "complete_final")
+        self.resume_stage_combo.addItem("只查看并确认最终静态数据集", "review_final_static")
+        self.resume_preprocessing_button = QPushButton("从所选步骤继续")
+        self.resume_preprocessing_button.clicked.connect(self.resume_preprocessing)
         self.preprocessing_progress = QProgressBar()
         self.preprocessing_progress.setRange(0, 1)
         self.preprocessing_progress.setValue(0)
@@ -354,6 +368,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.dynamic_strength_combo)
         layout.addLayout(buttons)
         layout.addWidget(self.view_static_dataset_button)
+        layout.addWidget(resume_label)
+        layout.addWidget(self.resume_workspace_edit)
+        layout.addWidget(resume_workspace_button)
+        layout.addWidget(self.resume_stage_combo)
+        layout.addWidget(self.resume_preprocessing_button)
         layout.addWidget(self.preprocessing_progress)
         layout.addWidget(self.preprocessing_log)
         return group
@@ -372,6 +391,11 @@ class MainWindow(QMainWindow):
         directory = QFileDialog.getExistingDirectory(self, "选择预处理保存目录")
         if directory:
             self.preprocess_project_directory_edit.setText(directory)
+
+    def choose_resume_workspace(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "选择已有照片预处理工程")
+        if directory:
+            self.resume_workspace_edit.setText(directory)
 
     def choose_reconstruction_project(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "选择工程保存目录")
@@ -427,6 +451,21 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.active_pipeline = None
             QMessageBox.warning(self, "无法开始照片预处理", str(exc))
+
+    def resume_preprocessing(self) -> None:
+        self.preprocessing_log.clear()
+        self.active_pipeline = "preprocessing"
+        try:
+            workspace = self.colmap_runner.resume_preprocessing(
+                Path(self.colmap_path_edit.text().strip()),
+                Path(self.preprocess_image_directory_edit.text().strip()),
+                Path(self.resume_workspace_edit.text().strip()),
+                str(self.resume_stage_combo.currentData()),
+            )
+            self.statusBar().showMessage(f"继续照片预处理：{workspace}")
+        except Exception as exc:
+            self.active_pipeline = None
+            QMessageBox.warning(self, "无法继续照片预处理", str(exc))
 
     def _append_reconstruction_log(self, text: str) -> None:
         target = (
@@ -499,6 +538,8 @@ class MainWindow(QMainWindow):
     def _set_reconstruction_running(self, running: bool) -> None:
         self.start_reconstruction_button.setEnabled(not running)
         self.start_preprocessing_button.setEnabled(not running)
+        self.resume_preprocessing_button.setEnabled(not running)
+        self.resume_stage_combo.setEnabled(not running)
         self.cancel_reconstruction_button.setEnabled(
             running and self.active_pipeline == "reconstruction"
         )
@@ -535,7 +576,10 @@ class MainWindow(QMainWindow):
             "照片预处理完成",
             "最终静态图片数据集已经生成，并自动填入下方的“照片一键重建”。\n\n"
             "请确认照片目录后，再点击“开始一键重建”。\n\n"
-            f"最终图片：{result.static_images}",
+            f"最终图片：{result.static_images}\n"
+            f"动态掩膜：{result.masks}\n"
+            f"第一次带框图片：{result.workspace / 'manual_review_initial'}\n"
+            f"第二次带框图片：{result.workspace / 'manual_review_final'}",
         )
 
     def _view_last_static_dataset(self) -> None:

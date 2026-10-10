@@ -7,7 +7,15 @@ import sqlite3
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import binary_dilation, label, map_coordinates
+from scipy.ndimage import (
+    binary_closing,
+    binary_dilation,
+    binary_erosion,
+    distance_transform_edt,
+    gaussian_filter,
+    label,
+    map_coordinates,
+)
 
 from rescuemap.core.dynamic_mask import MAX_IMAGE_ID, _blob_array, _decode_database_text
 
@@ -20,6 +28,9 @@ class CompletionSummary:
     completed_images: int
     strong_texture_pixels: int
     weak_texture_pixels: int
+    local_texture_pixels: int
+    small_hole_pixels: int
+    near_side_pixels: int
     report_path: Path
 
 
@@ -133,6 +144,159 @@ def _normalised_correlation(first: np.ndarray, second: np.ndarray) -> float:
     return float(np.clip(np.dot(first_gray, second_gray) / denominator, -1.0, 1.0))
 
 
+def _directional_boundary_fill(
+    rgb: np.ndarray,
+    hole: np.ndarray,
+    *,
+    use_median: bool = False,
+) -> np.ndarray:
+    """Extend visible boundary colours into a hole from surrounding directions.
+
+    Each directional pass transports the first visible pixel along its ray.
+    Blending several opposing rays prevents the one-sided smearing produced by
+    a single scan direction.  Medium holes use a texture-orientation weighted
+    mean; tiny holes use the per-channel median as a robust local majority.
+    """
+    rgb = np.asarray(rgb, dtype=float)
+    hole = np.asarray(hole, dtype=bool)
+    if not hole.any():
+        return np.empty((0, 3), dtype=np.uint8)
+
+    ys, xs = np.where(hole)
+    margin = max(8, min(48, int(np.sqrt(len(xs))) + 4))
+    y0, y1 = max(0, ys.min() - margin), min(hole.shape[0], ys.max() + margin + 1)
+    x0, x1 = max(0, xs.min() - margin), min(hole.shape[1], xs.max() + margin + 1)
+    local_hole = hole[y0:y1, x0:x1]
+    local_rgb = rgb[y0:y1, x0:x1]
+    height, width = local_hole.shape
+
+    ring = binary_dilation(local_hole, iterations=min(5, margin)) & ~local_hole
+    gray = local_rgb @ np.array([0.299, 0.587, 0.114])
+    gy, gx = np.gradient(gray)
+    if ring.any():
+        structure = np.array(
+            [
+                [np.mean(gx[ring] ** 2), np.mean(gx[ring] * gy[ring])],
+                [np.mean(gx[ring] * gy[ring]), np.mean(gy[ring] ** 2)],
+            ]
+        )
+        eigenvalues, eigenvectors = np.linalg.eigh(structure)
+        texture_direction = eigenvectors[:, int(np.argmin(eigenvalues))]
+    else:
+        texture_direction = np.array([1.0, 0.0])
+
+    known = ~local_hole
+    rows = np.arange(height)[:, None]
+    columns = np.arange(width)[None, :]
+    candidates: list[np.ndarray] = []
+    weights: list[np.ndarray] = []
+
+    def add_candidate(source_y, source_x, valid, distance, direction) -> None:
+        candidate = local_rgb[
+            np.clip(source_y, 0, height - 1),
+            np.clip(source_x, 0, width - 1),
+        ]
+        unit = np.asarray(direction, dtype=float)
+        unit /= max(float(np.linalg.norm(unit)), 1e-9)
+        alignment = 0.35 + 0.65 * abs(float(np.dot(unit, texture_direction)))
+        weight = np.zeros((height, width), dtype=float)
+        accepted = local_hole & valid
+        weight[accepted] = alignment / (1.0 + distance[accepted])
+        candidates.append(candidate)
+        weights.append(weight)
+
+    left_x = np.maximum.accumulate(np.where(known, columns, -1), axis=1)
+    add_candidate(rows, left_x, left_x >= 0, columns - left_x, (1, 0))
+
+    reverse_x = np.maximum.accumulate(
+        np.where(known[:, ::-1], columns, -1), axis=1
+    )
+    right_x = width - 1 - reverse_x[:, ::-1]
+    right_valid = reverse_x[:, ::-1] >= 0
+    add_candidate(rows, right_x, right_valid, right_x - columns, (-1, 0))
+
+    top_y = np.maximum.accumulate(np.where(known, rows, -1), axis=0)
+    add_candidate(top_y, columns, top_y >= 0, rows - top_y, (0, 1))
+
+    reverse_y = np.maximum.accumulate(
+        np.where(known[::-1, :], rows, -1), axis=0
+    )
+    bottom_y = height - 1 - reverse_y[::-1, :]
+    bottom_valid = reverse_y[::-1, :] >= 0
+    add_candidate(bottom_y, columns, bottom_valid, bottom_y - rows, (0, -1))
+
+    nearest_distance, nearest = distance_transform_edt(
+        local_hole, return_indices=True
+    )
+    add_candidate(
+        nearest[0], nearest[1], np.ones_like(local_hole), nearest_distance, (1, 1)
+    )
+
+    stack = np.stack(candidates)
+    weight_stack = np.stack(weights)
+    if use_median:
+        masked = np.where(weight_stack[:, :, :, None] > 0, stack, np.nan)
+        filled = np.nanmedian(masked, axis=0)
+    else:
+        denominator = weight_stack.sum(axis=0)
+        filled = np.divide(
+            (stack * weight_stack[:, :, :, None]).sum(axis=0),
+            denominator[:, :, None],
+            out=np.zeros_like(local_rgb),
+            where=denominator[:, :, None] > 0,
+        )
+    invalid = ~np.isfinite(filled).all(axis=2)
+    if not use_median:
+        invalid |= weight_stack.sum(axis=0) <= 0
+    if invalid.any():
+        _, nearest = distance_transform_edt(local_hole, return_indices=True)
+        nearest_values = local_rgb[nearest[0], nearest[1]]
+        filled[invalid] = nearest_values[invalid]
+    local_y, local_x = np.where(local_hole)
+    return np.clip(filled[local_y, local_x], 0, 255).astype(np.uint8)
+
+
+def _near_side_ground_fill(rgb: np.ndarray, hole: np.ndarray) -> np.ndarray:
+    """Fill from the lower/near-side boundary for forward-looking images."""
+    rgb = np.asarray(rgb, dtype=float)
+    hole = np.asarray(hole, dtype=bool)
+    ys, xs = np.where(hole)
+    if not len(xs):
+        return np.empty((0, 3), dtype=np.uint8)
+    ring = binary_dilation(hole, iterations=8) & ~hole
+    ring_y, ring_x = np.where(ring)
+    if not len(ring_x):
+        return _directional_boundary_fill(rgb, hole)
+    near_cut = np.quantile(ring_y, 0.62)
+    near_ring = ring & (np.indices(ring.shape)[0] >= near_cut)
+    samples = rgb[near_ring]
+    if len(samples) < 12:
+        samples = rgb[ring]
+    low, high = np.percentile(samples, (10, 90), axis=0)
+    trimmed = samples[np.all((samples >= low) & (samples <= high), axis=1)]
+    robust_mean = (trimmed if len(trimmed) >= 8 else samples).mean(axis=0)
+
+    height, width = hole.shape
+    rows = np.arange(height)[:, None]
+    columns = np.arange(width)[None, :]
+    known = ~hole
+    reverse_y = np.maximum.accumulate(
+        np.where(known[::-1, :], rows, -1), axis=0
+    )
+    source_y = height - 1 - reverse_y[::-1, :]
+    valid = reverse_y[::-1, :] >= 0
+    local = np.broadcast_to(robust_mean, rgb.shape).copy()
+    local[valid] = rgb[source_y[valid], np.broadcast_to(columns, hole.shape)[valid]]
+    # The lower boundary carries the near-side texture; mixing its ray colour
+    # with a trimmed local mean reduces car-light streaks and exposure jumps.
+    local = 0.68 * local + 0.32 * robust_mean
+    values = local[ys, xs]
+    missing = ~valid[ys, xs]
+    if missing.any():
+        values[missing] = _directional_boundary_fill(rgb, hole)[missing]
+    return np.clip(values, 0, 255).astype(np.uint8)
+
+
 def complete_dynamic_backgrounds(
     database_path: Path,
     image_directory: Path,
@@ -148,16 +312,23 @@ def complete_dynamic_backgrounds(
     preview_directory.mkdir(parents=True, exist_ok=True)
     total_dynamic = total_completed = completed_images = 0
     total_strong = total_weak = 0
+    total_local_texture = total_small_hole = total_near_side = 0
     image_reports = []
     for image_id, relative_name in names.items():
         source_path = image_directory / Path(relative_name)
         mask_path = mask_directory / (relative_name + ".png")
         rgb = np.asarray(Image.open(source_path).convert("RGB")).copy()
         static_mask = np.asarray(Image.open(mask_path).convert("L")) > 127
-        dynamic = ~static_mask
+        # Close tiny omissions in a hand-drawn box and include a one-pixel
+        # safety rim.  The original/manual annotation dataset is saved before
+        # this processing, so this cleanup never destroys the user's labels.
+        dynamic = binary_dilation(binary_closing(~static_mask, iterations=2), iterations=2)
         completed = np.zeros_like(dynamic)
         completed_strong = np.zeros_like(dynamic)
         completed_weak = np.zeros_like(dynamic)
+        completed_local_texture = np.zeros_like(dynamic)
+        completed_small_hole = np.zeros_like(dynamic)
+        completed_near_side = np.zeros_like(dynamic)
         result = rgb.copy()
         gray = rgb.astype(float) @ np.array([0.299, 0.587, 0.114])
         gradient = np.hypot(*np.gradient(gray))
@@ -255,6 +426,67 @@ def complete_dynamic_backgrounds(
                 completed_strong[ys[accepted], xs[accepted]] = True
             else:
                 completed_weak[ys[accepted], xs[accepted]] = True
+            component_centre_y = float(np.mean(ys)) / max(dynamic.shape[0] - 1, 1)
+            lower_ring_count = int(np.count_nonzero(ring & (
+                np.indices(ring.shape)[0] >= np.mean(ys)
+            )))
+            ground_like = component_centre_y >= 0.38 and lower_ring_count >= 12
+            if ground_like and accepted.any():
+                near_values = _near_side_ground_fill(rgb, component)
+                disagreement = np.mean(
+                    np.abs(median - near_values.astype(float)), axis=1
+                )
+                replace = accepted & (disagreement > 34.0)
+                result[ys[replace], xs[replace]] = near_values[replace]
+                completed_near_side[ys[replace], xs[replace]] = True
+                completed_strong[ys[replace], xs[replace]] = False
+                completed_weak[ys[replace], xs[replace]] = False
+        # Multi-view evidence remains the preferred source.  For unresolved
+        # components, use a bounded single-image fallback instead of leaving
+        # every pixel black.  Large/edge-touching holes stay masked because a
+        # plausible-looking texture there would be mostly invented.
+        unresolved_before_fallback = dynamic & ~completed
+        fallback_labels, fallback_count = label(unresolved_before_fallback)
+        image_area = int(dynamic.size)
+        small_limit = max(96, int(image_area * 0.00012))
+        medium_limit = max(6000, int(image_area * 0.035))
+        for fallback_id in range(1, fallback_count + 1):
+            hole = fallback_labels == fallback_id
+            hole_count = int(hole.sum())
+            if hole_count == 0:
+                continue
+            hy, hx = np.where(hole)
+            touches_edge = (
+                hy.min() == 0 or hx.min() == 0
+                or hy.max() == dynamic.shape[0] - 1
+                or hx.max() == dynamic.shape[1] - 1
+            )
+            centre_y = float(np.mean(hy)) / max(dynamic.shape[0] - 1, 1)
+            near_side_limit = max(medium_limit, int(image_area * 0.08))
+            if centre_y >= 0.38 and hole_count <= near_side_limit and not touches_edge:
+                values = _near_side_ground_fill(result, hole)
+                result[hy, hx] = values
+                completed[hy, hx] = True
+                completed_near_side[hy, hx] = True
+            elif hole_count <= small_limit:
+                values = _directional_boundary_fill(result, hole, use_median=True)
+                result[hy, hx] = values
+                completed[hy, hx] = True
+                completed_small_hole[hy, hx] = True
+            elif hole_count <= medium_limit and not touches_edge:
+                values = _directional_boundary_fill(result, hole, use_median=False)
+                result[hy, hx] = values
+                completed[hy, hx] = True
+                completed_local_texture[hy, hx] = True
+        # Feather only the inner edge of repaired regions.  Static pixels
+        # outside the annotation are never overwritten, while one-pixel gaps
+        # and hard rectangular seams are softened.
+        completed_boundary = completed & ~binary_erosion(completed, iterations=2)
+        if completed_boundary.any():
+            smoothed = gaussian_filter(result.astype(float), sigma=(0.9, 0.9, 0.0))
+            result[completed_boundary] = np.clip(
+                smoothed[completed_boundary], 0, 255
+            ).astype(np.uint8)
         unresolved = dynamic & ~completed
         result[unresolved] = 0
         updated_mask = np.where(unresolved, 0, 255).astype(np.uint8)
@@ -270,6 +502,15 @@ def complete_dynamic_backgrounds(
         preview[completed_weak] = (
             0.35 * preview[completed_weak] + 0.65 * np.array([40, 180, 245])
         ).astype(np.uint8)
+        preview[completed_local_texture] = (
+            0.35 * preview[completed_local_texture] + 0.65 * np.array([245, 170, 35])
+        ).astype(np.uint8)
+        preview[completed_small_hole] = (
+            0.35 * preview[completed_small_hole] + 0.65 * np.array([180, 90, 230])
+        ).astype(np.uint8)
+        preview[completed_near_side] = (
+            0.35 * preview[completed_near_side] + 0.65 * np.array([40, 220, 200])
+        ).astype(np.uint8)
         preview[unresolved] = (0.25 * preview[unresolved] + 0.75 * np.array([240, 50, 50])).astype(np.uint8)
         preview_target = preview_directory / Path(relative_name)
         preview_target.parent.mkdir(parents=True, exist_ok=True)
@@ -281,19 +522,41 @@ def complete_dynamic_backgrounds(
         weak_count = int(completed_weak.sum())
         total_strong += strong_count
         total_weak += weak_count
+        local_texture_count = int(completed_local_texture.sum())
+        small_hole_count = int(completed_small_hole.sum())
+        total_local_texture += local_texture_count
+        total_small_hole += small_hole_count
+        near_side_count = int(completed_near_side.sum())
+        total_near_side += near_side_count
         completed_images += int(completed_count > 0)
         image_reports.append({"image": relative_name, "dynamic_pixels": dynamic_count,
                               "completed_pixels": completed_count,
                               "strong_texture_completed_pixels": strong_count,
                               "weak_texture_completed_pixels": weak_count,
+                              "local_texture_completed_pixels": local_texture_count,
+                              "small_hole_completed_pixels": small_hole_count,
+                              "near_side_completed_pixels": near_side_count,
                               "unresolved_pixels": dynamic_count-completed_count,
                               "completion_ratio": completed_count/max(dynamic_count, 1)})
-    report_path.write_text(json.dumps({"method": "local_multiview_background_completion",
+    report_path.write_text(json.dumps({"method": "hybrid_multiview_directional_completion",
+        "fallback_policy": {
+            "small_hole": "robust_median_of_directional_boundary_samples",
+            "medium_hole": "texture_orientation_weighted_boundary_extension",
+            "large_or_border_hole": "keep_masked",
+            "forward_ground": "lower_near_side_trimmed_mean_and_ray_extension",
+            "small_area_ratio": 0.00012,
+            "medium_area_ratio": 0.035,
+        },
         "summary": {"dynamic_pixels": total_dynamic, "completed_pixels": total_completed,
                     "strong_texture_completed_pixels": total_strong,
                     "weak_texture_completed_pixels": total_weak,
+                    "local_texture_completed_pixels": total_local_texture,
+                    "small_hole_completed_pixels": total_small_hole,
+                    "near_side_completed_pixels": total_near_side,
                     "unresolved_pixels": total_dynamic-total_completed,
                     "completion_ratio": total_completed/max(total_dynamic, 1)},
         "images": image_reports}, ensure_ascii=False, indent=2), encoding="utf-8")
     return CompletionSummary(total_dynamic, total_completed, total_dynamic-total_completed,
-                             completed_images, total_strong, total_weak, report_path)
+                             completed_images, total_strong, total_weak,
+                             total_local_texture, total_small_hole,
+                             total_near_side, report_path)
