@@ -12,6 +12,10 @@ from rescuemap.core.calibration import (
     ground_alignment_transform,
     uniform_scale_transform,
 )
+from rescuemap.core.background_completion import (
+    _project_homography,
+    _robust_homography,
+)
 from rescuemap.core.colmap_runner import build_colmap_stages
 from rescuemap.core.candidate_validation import (
     ColmapCamera,
@@ -43,6 +47,22 @@ from rescuemap.core.terrain_mesh import build_terrain_mesh
 
 
 class DynamicSuppressionTests(unittest.TestCase):
+    def test_robust_homography_recovers_view_projection_with_outlier(self):
+        source = np.array(
+            [[0, 0], [10, 0], [0, 10], [10, 10], [4, 3], [7, 8], [2, 6]],
+            dtype=float,
+        )
+        expected = np.array([[1.1, 0.05, 20], [-0.03, 0.95, 12],
+                             [0.0005, -0.0003, 1.0]])
+        target = _project_homography(source, expected)
+        target[-1] += np.array([80.0, -50.0])
+
+        fitted, inlier_ratio = _robust_homography(source, target)
+        projected = _project_homography(source[:-1], fitted)
+
+        self.assertGreaterEqual(inlier_ratio, 6 / 7)
+        np.testing.assert_allclose(projected, target[:-1], atol=0.1)
+
     def test_edge_aware_growth_recovers_object_area_without_flooding_background(self):
         rgb = np.full((120, 160, 3), 155, dtype=np.uint8)
         rgb[35:85, 55:110] = np.array([190, 35, 35], dtype=np.uint8)

@@ -7,6 +7,7 @@ import sys
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
+from rescuemap.core.background_completion import complete_dynamic_backgrounds
 from rescuemap.core.dynamic_mask import generate_geometry_masks
 
 
@@ -426,6 +427,14 @@ class ColmapRunner(QObject):
             preview_directory=self._workspace / "dynamic_mask_previews",
             report_path=self._workspace / "dynamic_report.json",
         )
+        completion = complete_dynamic_backgrounds(
+            self._workspace / "dynamic_preview" / "database.db",
+            self._image_directory,
+            self._workspace / "dynamic_masks",
+            self._workspace / "static_images",
+            preview_directory=self._workspace / "background_completion_previews",
+            report_path=self._workspace / "background_completion_report.json",
+        )
         self.log_received.emit(
             "动态区域掩膜生成完成："
             f"{summary.masked_image_count}/{summary.image_count} 张照片检测到高置信动态区域，"
@@ -433,6 +442,9 @@ class ColmapRunner(QObject):
             f"平均几何静态可见率 {summary.mean_static_visibility * 100:.2f}%\n"
             "已使用几何种子引导的边缘约束区域扩张；"
             "掩膜预览与逐图统计已经保存，不确定区域继续保留。\n"
+            f"多视角背景互补：{completion.completed_images} 张照片获得可信补全，"
+            f"补全 {completion.completed_pixels}/{completion.dynamic_pixels} 个动态像素，"
+            f"其余 {completion.unresolved_pixels} 个像素保持屏蔽。\n"
         )
 
     def _process_error(self, error) -> None:
