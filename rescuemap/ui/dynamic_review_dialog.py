@@ -6,11 +6,11 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
-from scipy.ndimage import find_objects, label
+from scipy.ndimage import binary_dilation, find_objects, label
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QListWidget, QMessageBox, QPushButton,
+    QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
     QSplitter, QVBoxLayout, QWidget,
 )
 
@@ -50,13 +50,16 @@ class _MaskCanvas(QWidget):
         self.component_labels = None
         if self.static_mask is None:
             return
-        labels, count = label(~self.static_mask)
-        self.component_labels = labels
-        for region_id, slices in enumerate(find_objects(labels), start=1):
+        dynamic = ~self.static_mask
+        merge_iterations = min(18, max(4, min(dynamic.shape) // 120))
+        merged_labels, _count = label(binary_dilation(dynamic, iterations=merge_iterations))
+        self.component_labels = merged_labels
+        for region_id, slices in enumerate(find_objects(merged_labels), start=1):
             if slices is None:
                 continue
             y_slice, x_slice = slices
-            if int(np.count_nonzero(labels[slices] == region_id)) < 4:
+            merged_region = merged_labels[slices] == region_id
+            if int(np.count_nonzero(dynamic[slices] & merged_region)) < 4:
                 continue
             self.regions.append(_Region(region_id, (
                 int(x_slice.start), int(y_slice.start),
@@ -148,16 +151,31 @@ class DynamicReviewDialog(QDialog):
         self.current_index = -1
         self.dirty = False
         self.setWindowTitle(title)
-        self.resize(1180, 760)
+        self.resize(1020, 660)
 
         self.list_widget = QListWidget()
         self.list_widget.setMinimumWidth(230)
-        for path in self.paths:
-            self.list_widget.addItem(str(path.relative_to(self.image_directory)))
+        automatic = self._automatic_detection_counts()
+        first_detected = -1
+        for index, path in enumerate(self.paths):
+            relative = str(path.relative_to(self.image_directory)).replace("\\", "/")
+            count = automatic.get(relative, 0)
+            prefix = f"● 算法{count}处" if count > 0 else "○ 未检出"
+            item = QListWidgetItem(f"{prefix} | {relative}")
+            if count > 0:
+                item.setForeground(QColor("#d62828"))
+                if first_detected < 0:
+                    first_detected = index
+            self.list_widget.addItem(item)
         self.list_widget.currentRowChanged.connect(self._load_index)
         self.canvas = _MaskCanvas()
         self.canvas.changed.connect(self._mark_dirty)
-        help_label = QLabel("红框表示动态区域。左键拖框：添加；右键单击红框内部：删除。\n切换图片时会自动保存当前修改。")
+        detected_count = sum(value > 0 for value in automatic.values())
+        help_label = QLabel(
+            f"算法已在 {detected_count}/{len(self.paths)} 张图片中生成初始动态候选框。"
+            "红框是算法初标或人工补充；左键拖框添加，右键单击框内删除。\n"
+            "左侧“未检出”只表示算法没有足够证据，仍需人工检查。切换图片时自动保存。"
+        )
         help_label.setWordWrap(True)
         help_label.setStyleSheet("background:#fff3b0;color:#202020;padding:8px;border:1px solid #d6a800;")
         previous_button = QPushButton("上一张")
@@ -173,7 +191,23 @@ class DynamicReviewDialog(QDialog):
         splitter = QSplitter(); splitter.addWidget(self.list_widget); splitter.addWidget(right); splitter.setStretchFactor(1, 1)
         layout = QVBoxLayout(self); layout.addWidget(splitter)
         if self.paths:
-            self.list_widget.setCurrentRow(0)
+            self.list_widget.setCurrentRow(first_detected if first_detected >= 0 else 0)
+
+    def _automatic_detection_counts(self) -> dict[str, int]:
+        if self.phase != "review_initial":
+            return {}
+        report_path = self.mask_directory.parent / "dynamic_report.json"
+        if not report_path.is_file():
+            return {}
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            return {
+                str(item["image"]).replace("\\", "/"): int(item.get("dynamic_feature_clusters", 0))
+                for item in report.get("images", [])
+                if int(item.get("masked_pixels", 0)) > 0
+            }
+        except (OSError, ValueError, TypeError, KeyError):
+            return {}
 
     def _mask_path(self, image_path: Path) -> Path:
         return self.mask_directory / (str(image_path.relative_to(self.image_directory)) + ".png")
@@ -230,13 +264,17 @@ class DynamicReviewDialog(QDialog):
                     dynamic = np.asarray(opened.convert("L")) <= 127
             else:
                 dynamic = np.zeros((preview.height, preview.width), dtype=bool)
-            labels, _count = label(dynamic)
+            merge_iterations = min(18, max(4, min(dynamic.shape) // 120))
+            labels, _count = label(binary_dilation(dynamic, iterations=merge_iterations))
             boxes = []
             draw = ImageDraw.Draw(preview)
             for region_id, slices in enumerate(find_objects(labels), start=1):
-                if slices is None or int(np.count_nonzero(labels[slices] == region_id)) < 4:
+                if slices is None:
                     continue
                 y_slice, x_slice = slices
+                merged_region = labels[slices] == region_id
+                if int(np.count_nonzero(dynamic[slices] & merged_region)) < 4:
+                    continue
                 box = [int(x_slice.start), int(y_slice.start),
                        int(x_slice.stop - 1), int(y_slice.stop - 1)]
                 boxes.append(box)
@@ -255,7 +293,7 @@ class DynamicReviewDialog(QDialog):
 class _ComparisonCanvas(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setMinimumSize(760, 480)
+        self.setMinimumSize(620, 380)
         self.before: np.ndarray | None = None
         self.after: np.ndarray | None = None
 
@@ -315,7 +353,7 @@ class DatasetComparisonDialog(QDialog):
             if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
         )
         self.setWindowTitle(title)
-        self.resize(1280, 780)
+        self.resize(1080, 680)
         self.list_widget = QListWidget()
         self.list_widget.setMinimumWidth(230)
         for path in self.paths:
