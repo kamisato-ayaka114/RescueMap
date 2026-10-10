@@ -116,7 +116,10 @@ def build_colmap_stages(
         workspace / "enhanced_images" if low_light_enhancement else image_directory
     )
     enhancement_stages = (
-        [_Stage("统一增强夜间图像", "", (), "enhance_images")]
+        [
+            _Stage("统一增强夜间图像", "", (), "enhance_images"),
+            _Stage("人工检查夜间增强结果", "", (), "review_enhancement"),
+        ]
         if low_light_enhancement else []
     )
     formal_image_directory = processing_image_directory
@@ -168,6 +171,7 @@ def build_colmap_stages(
             _Stage("多视角恢复静态背景", "", (), "complete_backgrounds"),
             _Stage("人工复核恢复后的静态图片", "", (), "review_completed"),
             _Stage("生成最终静态图片数据集", "", (), "complete_final"),
+            _Stage("确认最终静态图片数据集", "", (), "review_final_static"),
         ]
 
     feature_arguments = [
@@ -255,6 +259,8 @@ class ColmapRunner(QObject):
     failed = Signal(str)
     running_changed = Signal(bool)
     review_requested = Signal(str, str, str)
+    enhancement_review_requested = Signal(str, str)
+    final_review_requested = Signal(str, str)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -355,6 +361,48 @@ class ColmapRunner(QObject):
         self.log_received.emit("人工复核结果已保存，继续处理。\n")
         QTimer.singleShot(0, self._start_next_stage)
 
+    def resume_after_enhancement_review(self, choice: str) -> None:
+        if not self._active:
+            return
+        if choice == "cancel":
+            self.cancel()
+            return
+        if choice == "original":
+            assert self._image_directory is not None
+            self._switch_processing_images(self._image_directory)
+            self.log_received.emit("已放弃夜间增强，本次重建继续使用原始照片。\n")
+        else:
+            self.log_received.emit("已确认夜间增强结果。\n")
+        QTimer.singleShot(0, self._start_next_stage)
+
+    def resume_after_final_review(self, choice: str) -> None:
+        if not self._active:
+            return
+        if choice == "cancel":
+            self.cancel()
+            return
+        if choice == "revise":
+            review_index = next(
+                index for index, stage in enumerate(self._stages)
+                if stage.kind == "review_completed"
+            )
+            self._stage_index = review_index - 1
+            self.log_received.emit("返回第二次动态框复核，可继续修正后重新生成最终数据集。\n")
+        else:
+            self.log_received.emit("最终静态图片数据集已确认，开始正式三维重建。\n")
+        QTimer.singleShot(0, self._start_next_stage)
+
+    def _switch_processing_images(self, directory: Path) -> None:
+        assert self._processing_image_directory is not None
+        old = str(self._processing_image_directory)
+        new = str(directory)
+        updated = []
+        for stage in self._stages:
+            arguments = tuple(new if argument == old else argument for argument in stage.arguments)
+            updated.append(_Stage(stage.title, stage.command, arguments, stage.kind))
+        self._stages = updated
+        self._processing_image_directory = directory
+
     def _start_next_stage(self) -> None:
         self._stage_index += 1
         if self._stage_index >= len(self._stages):
@@ -390,6 +438,13 @@ class ColmapRunner(QObject):
                 return
             QTimer.singleShot(0, self._start_next_stage)
             return
+        if stage.kind == "review_enhancement":
+            assert self._workspace is not None
+            assert self._image_directory is not None
+            self.enhancement_review_requested.emit(
+                str(self._image_directory), str(self._workspace / "enhanced_images")
+            )
+            return
         if stage.kind in {"review_initial", "review_completed"}:
             assert self._workspace is not None
             assert self._processing_image_directory is not None
@@ -400,6 +455,14 @@ class ColmapRunner(QObject):
             )
             self.review_requested.emit(
                 stage.kind, str(image_directory), str(self._workspace / "dynamic_masks")
+            )
+            return
+        if stage.kind == "review_final_static":
+            assert self._workspace is not None
+            assert self._processing_image_directory is not None
+            self.final_review_requested.emit(
+                str(self._processing_image_directory),
+                str(self._workspace / "static_images"),
             )
             return
         if stage.kind in {"complete_backgrounds", "complete_final"}:

@@ -250,3 +250,111 @@ class DynamicReviewDialog(QDialog):
             json.dumps({"phase": self.phase, "images": records}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+
+class _ComparisonCanvas(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumSize(760, 480)
+        self.before: np.ndarray | None = None
+        self.after: np.ndarray | None = None
+
+    def set_images(self, before: np.ndarray, after: np.ndarray) -> None:
+        self.before = before
+        self.after = after
+        self.update()
+
+    @staticmethod
+    def _pixmap(rgb: np.ndarray) -> QPixmap:
+        rgb = np.ascontiguousarray(rgb)
+        height, width = rgb.shape[:2]
+        image = QImage(rgb.data, width, height, 3 * width, QImage.Format.Format_RGB888)
+        return QPixmap.fromImage(image.copy())
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#20252b"))
+        if self.before is None or self.after is None:
+            return
+        margin, title_height, gap = 12, 34, 12
+        panel_width = max(1, (self.width() - margin * 2 - gap) // 2)
+        panel_height = max(1, self.height() - margin * 2 - title_height)
+        painter.setPen(QColor("#f3f5f7"))
+        painter.drawText(QRect(margin, margin, panel_width, title_height), Qt.AlignmentFlag.AlignCenter, "处理前")
+        painter.drawText(QRect(margin + panel_width + gap, margin, panel_width, title_height), Qt.AlignmentFlag.AlignCenter, "处理后")
+        for index, rgb in enumerate((self.before, self.after)):
+            pixmap = self._pixmap(rgb).scaled(
+                panel_width, panel_height, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            panel_x = margin + index * (panel_width + gap)
+            x = panel_x + (panel_width - pixmap.width()) // 2
+            y = margin + title_height + (panel_height - pixmap.height()) // 2
+            painter.drawPixmap(x, y, pixmap)
+
+
+class DatasetComparisonDialog(QDialog):
+    """Display every processing result before the reconstruction may continue."""
+
+    def __init__(
+        self,
+        before_directory: Path,
+        after_directory: Path,
+        *,
+        title: str,
+        confirm_text: str,
+        alternative_text: str | None = None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.before_directory = Path(before_directory)
+        self.after_directory = Path(after_directory)
+        self.choice = "cancel"
+        self.paths = sorted(
+            path for path in self.after_directory.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        )
+        self.setWindowTitle(title)
+        self.resize(1280, 780)
+        self.list_widget = QListWidget()
+        self.list_widget.setMinimumWidth(230)
+        for path in self.paths:
+            self.list_widget.addItem(str(path.relative_to(self.after_directory)))
+        self.canvas = _ComparisonCanvas()
+        self.list_widget.currentRowChanged.connect(self._load_index)
+        message = QLabel("逐张检查处理前后的差异，确认后才会进入下一阶段。")
+        message.setStyleSheet("background:#e8f4ff;color:#202020;padding:8px;border:1px solid #4b9bea;")
+        confirm = QPushButton(confirm_text)
+        confirm.clicked.connect(lambda: self._finish("confirm"))
+        cancel = QPushButton("取消本次重建")
+        cancel.clicked.connect(self.reject)
+        buttons = QHBoxLayout(); buttons.addStretch(); buttons.addWidget(cancel)
+        if alternative_text:
+            alternative = QPushButton(alternative_text)
+            alternative.clicked.connect(lambda: self._finish("alternative"))
+            buttons.addWidget(alternative)
+        buttons.addWidget(confirm)
+        right = QWidget(); right_layout = QVBoxLayout(right)
+        right_layout.addWidget(message); right_layout.addWidget(self.canvas, 1); right_layout.addLayout(buttons)
+        splitter = QSplitter(); splitter.addWidget(self.list_widget); splitter.addWidget(right); splitter.setStretchFactor(1, 1)
+        layout = QVBoxLayout(self); layout.addWidget(splitter)
+        if self.paths:
+            self.list_widget.setCurrentRow(0)
+
+    def _load_index(self, index: int) -> None:
+        if index < 0 or index >= len(self.paths):
+            return
+        after_path = self.paths[index]
+        relative = after_path.relative_to(self.after_directory)
+        before_path = self.before_directory / relative
+        if not before_path.is_file():
+            return
+        with Image.open(before_path) as opened:
+            before = np.asarray(opened.convert("RGB")).copy()
+        with Image.open(after_path) as opened:
+            after = np.asarray(opened.convert("RGB")).copy()
+        self.canvas.set_images(before, after)
+
+    def _finish(self, choice: str) -> None:
+        self.choice = choice
+        self.accept()

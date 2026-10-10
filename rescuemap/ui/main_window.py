@@ -72,7 +72,10 @@ from rescuemap.core.terrain import (
     build_terrain_grid,
 )
 from rescuemap.core.terrain_mesh import build_terrain_mesh
-from rescuemap.ui.dynamic_review_dialog import DynamicReviewDialog
+from rescuemap.ui.dynamic_review_dialog import (
+    DatasetComparisonDialog,
+    DynamicReviewDialog,
+)
 
 
 class CollapsibleGroupBox(QGroupBox):
@@ -131,6 +134,12 @@ class MainWindow(QMainWindow):
         self.colmap_runner.completed.connect(self._reconstruction_completed)
         self.colmap_runner.failed.connect(self._reconstruction_failed)
         self.colmap_runner.review_requested.connect(self._review_dynamic_dataset)
+        self.colmap_runner.enhancement_review_requested.connect(
+            self._review_enhanced_dataset
+        )
+        self.colmap_runner.final_review_requested.connect(
+            self._review_final_static_dataset
+        )
 
         self.plotter = QtInteractor(self)
         self.plotter.set_background("#20252b")
@@ -379,6 +388,34 @@ class MainWindow(QMainWindow):
         )
         accepted = dialog.exec() == dialog.DialogCode.Accepted
         self.colmap_runner.resume_after_review(accepted)
+
+    def _review_enhanced_dataset(self, original_directory: str, enhanced_directory: str) -> None:
+        dialog = DatasetComparisonDialog(
+            Path(original_directory), Path(enhanced_directory),
+            title="检查夜间图像增强结果",
+            confirm_text="使用增强照片继续",
+            alternative_text="放弃增强，使用原始照片",
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            choice = "cancel"
+        else:
+            choice = "original" if dialog.choice == "alternative" else "enhanced"
+        self.colmap_runner.resume_after_enhancement_review(choice)
+
+    def _review_final_static_dataset(self, original_directory: str, static_directory: str) -> None:
+        dialog = DatasetComparisonDialog(
+            Path(original_directory), Path(static_directory),
+            title="确认最终静态图片数据集",
+            confirm_text="确认数据集并开始三维重建",
+            alternative_text="返回继续修正动态框",
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            choice = "cancel"
+        else:
+            choice = "revise" if dialog.choice == "alternative" else "confirm"
+        self.colmap_runner.resume_after_final_review(choice)
 
     def _reconstruction_completed(self, result: ReconstructionResult) -> None:
         self.reconstruction_progress.setValue(self.reconstruction_progress.maximum())

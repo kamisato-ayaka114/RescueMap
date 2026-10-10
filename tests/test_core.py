@@ -235,13 +235,14 @@ class CandidateValidationTests(unittest.TestCase):
                 True,
             )
 
-            self.assertEqual(len(stages), 15)
+            self.assertEqual(len(stages), 16)
             self.assertEqual(stages[3].kind, "generate_masks")
             self.assertEqual(stages[4].kind, "review_initial")
             self.assertEqual(stages[5].kind, "complete_backgrounds")
             self.assertEqual(stages[6].kind, "review_completed")
             self.assertEqual(stages[7].kind, "complete_final")
-            formal_feature = stages[8]
+            self.assertEqual(stages[8].kind, "review_final_static")
+            formal_feature = stages[9]
             self.assertIn("--ImageReader.mask_path", formal_feature.arguments)
             self.assertIn(str(workspace / "static_images"), formal_feature.arguments)
 
@@ -255,7 +256,8 @@ class CandidateValidationTests(unittest.TestCase):
                 "standard", True, True,
             )
             self.assertEqual(stages[0].kind, "enhance_images")
-            self.assertIn(str(workspace / "enhanced_images"), stages[1].arguments)
+            self.assertEqual(stages[1].kind, "review_enhancement")
+            self.assertIn(str(workspace / "enhanced_images"), stages[2].arguments)
 
 
 class CalibrationTests(unittest.TestCase):
