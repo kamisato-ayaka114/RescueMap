@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import QObject, QProcess, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, QThread, QTimer, Signal, Slot
 
 from rescuemap.core.background_completion import complete_dynamic_backgrounds
 from rescuemap.core.dynamic_mask import generate_geometry_masks
@@ -48,6 +48,24 @@ class _Stage:
     command: str
     arguments: tuple[str, ...]
     kind: str = "process"
+
+
+class _FunctionWorker(QObject):
+    finished = Signal()
+    failed = Signal(str)
+
+    def __init__(self, function) -> None:
+        super().__init__()
+        self.function = function
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.function()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit()
 
 
 def resolve_colmap_executable(selected_path: Path) -> Path:
@@ -288,6 +306,9 @@ class ColmapRunner(QObject):
         self._cancelled = False
         self._active = False
         self._preprocess_only = False
+        self._background_thread: QThread | None = None
+        self._background_worker: _FunctionWorker | None = None
+        self._background_failure_prefix = "照片处理失败"
 
     @property
     def is_running(self) -> bool:
@@ -363,6 +384,8 @@ class ColmapRunner(QObject):
         self.log_received.emit("\n正在取消重建任务……\n")
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self.process.kill()
+        elif self._background_thread is not None and self._background_thread.isRunning():
+            self.log_received.emit("当前图片步骤会安全结束后停止，请稍候。\n")
         else:
             self._active = False
             self.running_changed.emit(False)
@@ -436,24 +459,12 @@ class ColmapRunner(QObject):
         if self._workspace is not None:
             self.process.setWorkingDirectory(str(self._workspace))
         if stage.kind == "generate_masks":
-            try:
-                self._generate_dynamic_masks()
-            except Exception as exc:
-                self._active = False
-                self.running_changed.emit(False)
-                self.failed.emit(f"自动生成动态区域掩膜失败：{exc}")
-                return
-            QTimer.singleShot(0, self._start_next_stage)
+            self._start_python_stage(
+                self._generate_dynamic_masks, "自动生成动态区域掩膜失败"
+            )
             return
         if stage.kind == "enhance_images":
-            try:
-                self._enhance_images()
-            except Exception as exc:
-                self._active = False
-                self.running_changed.emit(False)
-                self.failed.emit(f"夜间图像增强失败：{exc}")
-                return
-            QTimer.singleShot(0, self._start_next_stage)
+            self._start_python_stage(self._enhance_images, "夜间图像增强失败")
             return
         if stage.kind == "review_enhancement":
             assert self._workspace is not None
@@ -483,16 +494,55 @@ class ColmapRunner(QObject):
             )
             return
         if stage.kind in {"complete_backgrounds", "complete_final"}:
-            try:
-                self._complete_dynamic_backgrounds(final=stage.kind == "complete_final")
-            except Exception as exc:
-                self._active = False
-                self.running_changed.emit(False)
-                self.failed.emit(f"多视角背景恢复失败：{exc}")
-                return
-            QTimer.singleShot(0, self._start_next_stage)
+            final = stage.kind == "complete_final"
+            self._start_python_stage(
+                lambda: self._complete_dynamic_backgrounds(final=final),
+                "多视角背景恢复失败",
+            )
             return
         self.process.start(stage.command, list(stage.arguments))
+
+    def _start_python_stage(self, function, failure_prefix: str) -> None:
+        thread = QThread(self)
+        worker = _FunctionWorker(function)
+        self._background_failure_prefix = failure_prefix
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(self._python_stage_succeeded)
+        worker.failed.connect(self._python_stage_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_background_task)
+        self._background_thread = thread
+        self._background_worker = worker
+        thread.start()
+
+    def _python_stage_succeeded(self) -> None:
+        if not self._active:
+            return
+        if self._cancelled:
+            self._active = False
+            self.running_changed.emit(False)
+            self.failed.emit("任务已取消，已生成的中间文件仍保留在工作区中。")
+            return
+        QTimer.singleShot(0, self._start_next_stage)
+
+    def _python_stage_failed(self, message: str) -> None:
+        if not self._active:
+            return
+        self._active = False
+        self.running_changed.emit(False)
+        if self._cancelled:
+            self.failed.emit("任务已取消，已生成的中间文件仍保留在工作区中。")
+        else:
+            self.failed.emit(f"{self._background_failure_prefix}：{message}")
+
+    def _clear_background_task(self) -> None:
+        self._background_thread = None
+        self._background_worker = None
 
     def _read_output(self) -> None:
         data = bytes(self.process.readAllStandardOutput())

@@ -342,6 +342,8 @@ class DatasetComparisonDialog(QDialog):
         title: str,
         confirm_text: str,
         alternative_text: str | None = None,
+        message_text: str = "逐张检查处理前后的差异，确认后才会进入下一阶段。",
+        show_cancel: bool = True,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -360,13 +362,15 @@ class DatasetComparisonDialog(QDialog):
             self.list_widget.addItem(str(path.relative_to(self.after_directory)))
         self.canvas = _ComparisonCanvas()
         self.list_widget.currentRowChanged.connect(self._load_index)
-        message = QLabel("逐张检查处理前后的差异，确认后才会进入下一阶段。")
+        message = QLabel(message_text)
         message.setStyleSheet("background:#e8f4ff;color:#202020;padding:8px;border:1px solid #4b9bea;")
         confirm = QPushButton(confirm_text)
         confirm.clicked.connect(lambda: self._finish("confirm"))
-        cancel = QPushButton("取消本次重建")
-        cancel.clicked.connect(self.reject)
-        buttons = QHBoxLayout(); buttons.addStretch(); buttons.addWidget(cancel)
+        buttons = QHBoxLayout(); buttons.addStretch()
+        if show_cancel:
+            cancel = QPushButton("取消本次任务")
+            cancel.clicked.connect(self.reject)
+            buttons.addWidget(cancel)
         if alternative_text:
             alternative = QPushButton(alternative_text)
             alternative.clicked.connect(lambda: self._finish("alternative"))

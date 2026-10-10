@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pyvista as pv
-from PySide6.QtCore import QEvent, QPoint, QRect, QSettings, Qt
+from PySide6.QtCore import QElapsedTimer, QEvent, QPoint, QRect, QSettings, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
+    QProgressDialog,
     QRubberBand,
     QScrollArea,
     QSizePolicy,
@@ -129,6 +130,13 @@ class MainWindow(QMainWindow):
         self.context_mesh: SceneModel | None = None
         self.settings = QSettings("RescueMap", "RescueMap")
         self.active_pipeline: str | None = None
+        self.last_preprocessing_result: PreprocessingResult | None = None
+        self.processing_wait_dialog: QProgressDialog | None = None
+        self.processing_wait_title = ""
+        self.processing_elapsed = QElapsedTimer()
+        self.processing_timer = QTimer(self)
+        self.processing_timer.setInterval(1000)
+        self.processing_timer.timeout.connect(self._update_processing_wait_dialog)
         self.colmap_runner = ColmapRunner(self)
         self.colmap_runner.log_received.connect(self._append_reconstruction_log)
         self.colmap_runner.stage_changed.connect(self._update_reconstruction_stage)
@@ -289,6 +297,15 @@ class MainWindow(QMainWindow):
             "人工增删框 → 多视角背景恢复 → 最终确认。"
         )
         explanation.setWordWrap(True)
+        ordering_note = QLabel(
+            "重要：软件按文件名排序来寻找前后相邻照片。请让文件名随拍摄时间递增，"
+            "例如 0001.jpg、0002.jpg、0003.jpg。"
+        )
+        ordering_note.setWordWrap(True)
+        ordering_note.setStyleSheet(
+            "color: #9a5b00; background: #fff4d6; border: 1px solid #e3b341; "
+            "border-radius: 4px; padding: 6px;"
+        )
         self.preprocess_image_directory_edit = QLineEdit()
         self.preprocess_image_directory_edit.setPlaceholderText("包含原始照片的文件夹")
         image_button = QPushButton("选择原始照片文件夹")
@@ -314,6 +331,9 @@ class MainWindow(QMainWindow):
         self.cancel_preprocessing_button.setEnabled(False)
         buttons.addWidget(self.start_preprocessing_button)
         buttons.addWidget(self.cancel_preprocessing_button)
+        self.view_static_dataset_button = QPushButton("再次查看最近的静态数据集")
+        self.view_static_dataset_button.setEnabled(False)
+        self.view_static_dataset_button.clicked.connect(self._view_last_static_dataset)
         self.preprocessing_progress = QProgressBar()
         self.preprocessing_progress.setRange(0, 1)
         self.preprocessing_progress.setValue(0)
@@ -322,6 +342,7 @@ class MainWindow(QMainWindow):
         self.preprocessing_log.setReadOnly(True)
         self.preprocessing_log.setMaximumHeight(140)
         layout.addWidget(explanation)
+        layout.addWidget(ordering_note)
         layout.addWidget(QLabel("原始照片目录："))
         layout.addWidget(self.preprocess_image_directory_edit)
         layout.addWidget(image_button)
@@ -332,6 +353,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("自动动态检测强度："))
         layout.addWidget(self.dynamic_strength_combo)
         layout.addLayout(buttons)
+        layout.addWidget(self.view_static_dataset_button)
         layout.addWidget(self.preprocessing_progress)
         layout.addWidget(self.preprocessing_log)
         return group
@@ -419,6 +441,7 @@ class MainWindow(QMainWindow):
         target.ensureCursorVisible()
 
     def _update_reconstruction_stage(self, current: int, total: int, title: str) -> None:
+        self._hide_processing_wait_dialog()
         progress = (
             self.preprocessing_progress
             if self.active_pipeline == "preprocessing"
@@ -428,6 +451,50 @@ class MainWindow(QMainWindow):
         progress.setValue(current - 1)
         progress.setFormat(f"第 {current}/{total} 步：{title}")
         self.statusBar().showMessage(f"{'照片预处理' if self.active_pipeline == 'preprocessing' else 'COLMAP'}：{title}")
+        if title in {
+            "统一增强夜间图像",
+            "快速提取低分辨率特征",
+            "快速匹配相邻图像",
+            "估计预览相机位姿",
+            "分析跨帧几何并生成动态掩膜",
+            "多视角恢复静态背景",
+            "生成最终静态图片数据集",
+        }:
+            self._show_processing_wait_dialog(title)
+
+    def _show_processing_wait_dialog(self, title: str) -> None:
+        self.processing_wait_title = title
+        self.processing_elapsed.start()
+        dialog = QProgressDialog(self)
+        dialog.setWindowTitle("照片处理中")
+        dialog.setLabelText(f"{title}\n已耗时 0 秒，请稍候……")
+        dialog.setRange(0, 0)
+        dialog.setCancelButton(None)
+        dialog.setMinimumDuration(0)
+        dialog.setMinimumWidth(360)
+        dialog.setAutoClose(False)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        self.processing_wait_dialog = dialog
+        self.processing_timer.start()
+        dialog.show()
+
+    def _update_processing_wait_dialog(self) -> None:
+        if self.processing_wait_dialog is None:
+            self.processing_timer.stop()
+            return
+        seconds = max(0, self.processing_elapsed.elapsed() // 1000)
+        minutes, remainder = divmod(seconds, 60)
+        elapsed_text = f"{minutes} 分 {remainder} 秒" if minutes else f"{remainder} 秒"
+        self.processing_wait_dialog.setLabelText(
+            f"{self.processing_wait_title}\n已耗时 {elapsed_text}，请稍候……"
+        )
+
+    def _hide_processing_wait_dialog(self) -> None:
+        self.processing_timer.stop()
+        if self.processing_wait_dialog is not None:
+            self.processing_wait_dialog.close()
+            self.processing_wait_dialog.deleteLater()
+            self.processing_wait_dialog = None
 
     def _set_reconstruction_running(self, running: bool) -> None:
         self.start_reconstruction_button.setEnabled(not running)
@@ -442,6 +509,7 @@ class MainWindow(QMainWindow):
         self.dynamic_strength_combo.setEnabled(not running)
 
     def _reconstruction_failed(self, message: str) -> None:
+        self._hide_processing_wait_dialog()
         progress = (
             self.preprocessing_progress
             if self.active_pipeline == "preprocessing"
@@ -453,6 +521,9 @@ class MainWindow(QMainWindow):
         self.active_pipeline = None
 
     def _preprocessing_completed(self, result: PreprocessingResult) -> None:
+        self._hide_processing_wait_dialog()
+        self.last_preprocessing_result = result
+        self.view_static_dataset_button.setEnabled(True)
         self.preprocessing_progress.setValue(self.preprocessing_progress.maximum())
         self.preprocessing_progress.setFormat("照片预处理完成，已送入一键重建")
         self.image_directory_edit.setText(str(result.static_images))
@@ -466,6 +537,24 @@ class MainWindow(QMainWindow):
             "请确认照片目录后，再点击“开始一键重建”。\n\n"
             f"最终图片：{result.static_images}",
         )
+
+    def _view_last_static_dataset(self) -> None:
+        result = self.last_preprocessing_result
+        if result is None or not result.static_images.is_dir():
+            QMessageBox.warning(self, "无法查看", "最近的静态图片数据集已经不存在。")
+            self.view_static_dataset_button.setEnabled(False)
+            return
+        original = Path(self.preprocess_image_directory_edit.text().strip())
+        dialog = DatasetComparisonDialog(
+            original,
+            result.static_images,
+            title="查看最终静态图片数据集",
+            confirm_text="关闭查看",
+            message_text="这里保留最近一次处理后的静态数据集，可逐张与原照片比较。",
+            show_cancel=False,
+            parent=self,
+        )
+        dialog.exec()
 
     def _review_dynamic_dataset(
         self, phase: str, image_directory: str, mask_directory: str
@@ -500,7 +589,7 @@ class MainWindow(QMainWindow):
         dialog = DatasetComparisonDialog(
             Path(original_directory), Path(static_directory),
             title="确认最终静态图片数据集",
-            confirm_text="确认数据集并开始三维重建",
+            confirm_text="确认并保存静态数据集",
             alternative_text="返回继续修正动态框",
             parent=self,
         )
@@ -511,6 +600,7 @@ class MainWindow(QMainWindow):
         self.colmap_runner.resume_after_final_review(choice)
 
     def _reconstruction_completed(self, result: ReconstructionResult) -> None:
+        self._hide_processing_wait_dialog()
         self.reconstruction_progress.setValue(self.reconstruction_progress.maximum())
         self.reconstruction_progress.setFormat("重建完成，正在加载三维地图")
         self.load_model(result.point_cloud)
@@ -2782,5 +2872,14 @@ class MainWindow(QMainWindow):
         self.plotter.render()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self.colmap_runner.is_running:
+            QMessageBox.information(
+                self,
+                "任务仍在运行",
+                "照片处理或重建仍在运行。请等待当前步骤完成，或先点击取消。",
+            )
+            event.ignore()
+            return
+        self._hide_processing_wait_dialog()
         self.plotter.close()
         super().closeEvent(event)
