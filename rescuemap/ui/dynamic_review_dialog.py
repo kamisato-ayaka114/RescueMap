@@ -1,0 +1,252 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw
+from scipy.ndimage import find_objects, label
+from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import (
+    QDialog, QHBoxLayout, QLabel, QListWidget, QMessageBox, QPushButton,
+    QSplitter, QVBoxLayout, QWidget,
+)
+
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+
+
+@dataclass(slots=True)
+class _Region:
+    label_id: int
+    bounds: tuple[int, int, int, int]
+
+
+class _MaskCanvas(QWidget):
+    changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumSize(640, 480)
+        self.setMouseTracking(True)
+        self.rgb: np.ndarray | None = None
+        self.static_mask: np.ndarray | None = None
+        self.regions: list[_Region] = []
+        self.component_labels: np.ndarray | None = None
+        self.start: QPoint | None = None
+        self.current: QPoint | None = None
+        self._display_rect = QRect()
+
+    def set_data(self, rgb: np.ndarray, static_mask: np.ndarray) -> None:
+        self.rgb = rgb
+        self.static_mask = static_mask.copy()
+        self._rebuild_regions()
+        self.update()
+
+    def _rebuild_regions(self) -> None:
+        self.regions.clear()
+        self.component_labels = None
+        if self.static_mask is None:
+            return
+        labels, count = label(~self.static_mask)
+        self.component_labels = labels
+        for region_id, slices in enumerate(find_objects(labels), start=1):
+            if slices is None:
+                continue
+            y_slice, x_slice = slices
+            if int(np.count_nonzero(labels[slices] == region_id)) < 4:
+                continue
+            self.regions.append(_Region(region_id, (
+                int(x_slice.start), int(y_slice.start),
+                int(x_slice.stop - 1), int(y_slice.stop - 1),
+            )))
+
+    def _image_point(self, point: QPoint) -> tuple[int, int] | None:
+        if self.rgb is None or not self._display_rect.contains(point):
+            return None
+        height, width = self.rgb.shape[:2]
+        x = int((point.x() - self._display_rect.x()) * width / max(self._display_rect.width(), 1))
+        y = int((point.y() - self._display_rect.y()) * height / max(self._display_rect.height(), 1))
+        return min(width - 1, max(0, x)), min(height - 1, max(0, y))
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#20252b"))
+        if self.rgb is None:
+            painter.setPen(Qt.GlobalColor.white)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "没有图片")
+            return
+        height, width = self.rgb.shape[:2]
+        image = QImage(self.rgb.data, width, height, 3 * width, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(image.copy()).scaled(
+            self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        )
+        x = (self.width() - pixmap.width()) // 2
+        y = (self.height() - pixmap.height()) // 2
+        self._display_rect = QRect(x, y, pixmap.width(), pixmap.height())
+        painter.drawPixmap(x, y, pixmap)
+        sx, sy = pixmap.width() / width, pixmap.height() / height
+        painter.setPen(QPen(QColor("#ff3030"), 2))
+        for region in self.regions:
+            x0, y0, x1, y1 = region.bounds
+            painter.drawRect(QRect(int(x + x0*sx), int(y + y0*sy), max(2, int((x1-x0+1)*sx)), max(2, int((y1-y0+1)*sy))))
+        if self.start is not None and self.current is not None:
+            painter.setPen(QPen(QColor("#22d3ee"), 3, Qt.PenStyle.DashLine))
+            painter.drawRect(QRect(self.start, self.current).normalized())
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self._image_point(event.position().toPoint()):
+            self.start = event.position().toPoint()
+            self.current = self.start
+            self.update()
+        elif event.button() == Qt.MouseButton.RightButton:
+            point = self._image_point(event.position().toPoint())
+            if point is not None and self.static_mask is not None:
+                x, y = point
+                for index in range(len(self.regions) - 1, -1, -1):
+                    x0, y0, x1, y1 = self.regions[index].bounds
+                    if x0 <= x <= x1 and y0 <= y <= y1:
+                        if self.component_labels is not None:
+                            self.static_mask[
+                                self.component_labels == self.regions[index].label_id
+                            ] = True
+                        self._rebuild_regions()
+                        self.changed.emit()
+                        self.update()
+                        break
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self.start is not None:
+            self.current = event.position().toPoint()
+            self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton or self.start is None or self.static_mask is None:
+            return
+        first, second = self._image_point(self.start), self._image_point(event.position().toPoint())
+        self.start = self.current = None
+        if first is not None and second is not None:
+            x0, x1 = sorted((first[0], second[0])); y0, y1 = sorted((first[1], second[1]))
+            if x1 - x0 >= 3 and y1 - y0 >= 3:
+                self.static_mask[y0:y1+1, x0:x1+1] = False
+                self._rebuild_regions(); self.changed.emit()
+        self.update()
+
+
+class DynamicReviewDialog(QDialog):
+    """Review automatic dynamic regions; left-drag adds and right-click removes."""
+
+    def __init__(self, image_directory: Path, mask_directory: Path, *, phase: str, title: str, parent=None) -> None:
+        super().__init__(parent)
+        self.image_directory = Path(image_directory)
+        self.mask_directory = Path(mask_directory)
+        self.phase = phase
+        self.paths = sorted(path for path in self.image_directory.rglob("*")
+                            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
+        self.current_index = -1
+        self.dirty = False
+        self.setWindowTitle(title)
+        self.resize(1180, 760)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setMinimumWidth(230)
+        for path in self.paths:
+            self.list_widget.addItem(str(path.relative_to(self.image_directory)))
+        self.list_widget.currentRowChanged.connect(self._load_index)
+        self.canvas = _MaskCanvas()
+        self.canvas.changed.connect(self._mark_dirty)
+        help_label = QLabel("红框表示动态区域。左键拖框：添加；右键单击红框内部：删除。\n切换图片时会自动保存当前修改。")
+        help_label.setWordWrap(True)
+        help_label.setStyleSheet("background:#fff3b0;color:#202020;padding:8px;border:1px solid #d6a800;")
+        previous_button = QPushButton("上一张")
+        next_button = QPushButton("下一张")
+        previous_button.clicked.connect(lambda: self.list_widget.setCurrentRow(max(0, self.current_index - 1)))
+        next_button.clicked.connect(lambda: self.list_widget.setCurrentRow(min(len(self.paths)-1, self.current_index + 1)))
+        accept_button = QPushButton("保存复核结果并继续")
+        cancel_button = QPushButton("取消本次重建")
+        accept_button.clicked.connect(self._accept)
+        cancel_button.clicked.connect(self.reject)
+        buttons = QHBoxLayout(); buttons.addWidget(previous_button); buttons.addWidget(next_button); buttons.addStretch(); buttons.addWidget(cancel_button); buttons.addWidget(accept_button)
+        right = QWidget(); right_layout = QVBoxLayout(right); right_layout.addWidget(help_label); right_layout.addWidget(self.canvas, 1); right_layout.addLayout(buttons)
+        splitter = QSplitter(); splitter.addWidget(self.list_widget); splitter.addWidget(right); splitter.setStretchFactor(1, 1)
+        layout = QVBoxLayout(self); layout.addWidget(splitter)
+        if self.paths:
+            self.list_widget.setCurrentRow(0)
+
+    def _mask_path(self, image_path: Path) -> Path:
+        return self.mask_directory / (str(image_path.relative_to(self.image_directory)) + ".png")
+
+    def _save_current(self) -> None:
+        if self.current_index < 0 or not self.dirty or self.canvas.static_mask is None:
+            return
+        path = self._mask_path(self.paths[self.current_index]); path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.where(self.canvas.static_mask, 255, 0).astype(np.uint8), "L").save(path)
+        self.dirty = False
+
+    def _load_index(self, index: int) -> None:
+        self._save_current()
+        if index < 0 or index >= len(self.paths):
+            return
+        self.current_index = index
+        with Image.open(self.paths[index]) as opened:
+            rgb = np.asarray(opened.convert("RGB")).copy()
+        mask_path = self._mask_path(self.paths[index])
+        if mask_path.is_file():
+            with Image.open(mask_path) as opened:
+                static_mask = np.asarray(opened.convert("L")) > 127
+        else:
+            static_mask = np.ones(rgb.shape[:2], dtype=bool)
+        if static_mask.shape != rgb.shape[:2]:
+            QMessageBox.warning(self, "掩膜尺寸错误", f"{mask_path.name} 与照片尺寸不一致。")
+            static_mask = np.ones(rgb.shape[:2], dtype=bool)
+        self.canvas.set_data(rgb, static_mask); self.dirty = False
+
+    def _mark_dirty(self) -> None:
+        self.dirty = True
+
+    def _accept(self) -> None:
+        self._save_current()
+        self._export_boxed_dataset()
+        self.accept()
+
+    def _export_boxed_dataset(self) -> None:
+        """Save reproducible annotations and red-box previews separate from inputs."""
+        workspace = self.mask_directory.parent
+        preview_directory = workspace / (
+            "manual_review_initial" if self.phase == "review_initial"
+            else "manual_review_final"
+        )
+        preview_directory.mkdir(parents=True, exist_ok=True)
+        records = []
+        for image_path in self.paths:
+            relative = image_path.relative_to(self.image_directory)
+            with Image.open(image_path) as opened:
+                preview = opened.convert("RGB")
+            mask_path = self._mask_path(image_path)
+            if mask_path.is_file():
+                with Image.open(mask_path) as opened:
+                    dynamic = np.asarray(opened.convert("L")) <= 127
+            else:
+                dynamic = np.zeros((preview.height, preview.width), dtype=bool)
+            labels, _count = label(dynamic)
+            boxes = []
+            draw = ImageDraw.Draw(preview)
+            for region_id, slices in enumerate(find_objects(labels), start=1):
+                if slices is None or int(np.count_nonzero(labels[slices] == region_id)) < 4:
+                    continue
+                y_slice, x_slice = slices
+                box = [int(x_slice.start), int(y_slice.start),
+                       int(x_slice.stop - 1), int(y_slice.stop - 1)]
+                boxes.append(box)
+                draw.rectangle(box, outline=(255, 35, 35), width=max(2, min(preview.size)//500))
+            target = preview_directory / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            options = {"quality": 92} if target.suffix.lower() in {".jpg", ".jpeg"} else {}
+            preview.save(target, **options)
+            records.append({"image": str(relative).replace("\\", "/"), "boxes": boxes})
+        (workspace / f"{self.phase}_annotations.json").write_text(
+            json.dumps({"phase": self.phase, "images": records}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )

@@ -72,6 +72,7 @@ from rescuemap.core.terrain import (
     build_terrain_grid,
 )
 from rescuemap.core.terrain_mesh import build_terrain_mesh
+from rescuemap.ui.dynamic_review_dialog import DynamicReviewDialog
 
 
 class CollapsibleGroupBox(QGroupBox):
@@ -129,6 +130,7 @@ class MainWindow(QMainWindow):
         self.colmap_runner.running_changed.connect(self._set_reconstruction_running)
         self.colmap_runner.completed.connect(self._reconstruction_completed)
         self.colmap_runner.failed.connect(self._reconstruction_failed)
+        self.colmap_runner.review_requested.connect(self._review_dynamic_dataset)
 
         self.plotter = QtInteractor(self)
         self.plotter.set_background("#20252b")
@@ -251,6 +253,14 @@ class MainWindow(QMainWindow):
         self.dynamic_suppression_checkbox.toggled.connect(
             self.dynamic_strength_combo.setEnabled
         )
+        self.low_light_enhancement_checkbox = QCheckBox(
+            "统一增强夜间/弱光照片（保留原图）"
+        )
+        self.low_light_enhancement_checkbox.setChecked(False)
+        self.low_light_enhancement_checkbox.setToolTip(
+            "使用整个数据集共用的亮度映射提高暗部对比度，避免逐张自动增强造成亮度跳变。"
+            "增强图另存到本次工作区，不会覆盖原始照片。"
+        )
 
         buttons = QHBoxLayout()
         self.start_reconstruction_button = QPushButton("开始一键重建")
@@ -284,6 +294,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.dynamic_suppression_checkbox)
         layout.addWidget(QLabel("动态抑制强度："))
         layout.addWidget(self.dynamic_strength_combo)
+        layout.addWidget(self.low_light_enhancement_checkbox)
         layout.addLayout(buttons)
         layout.addWidget(self.reconstruction_progress)
         layout.addWidget(self.reconstruction_log)
@@ -320,6 +331,7 @@ class MainWindow(QMainWindow):
                 str(self.reconstruction_quality_combo.currentData()),
                 self.dynamic_suppression_checkbox.isChecked(),
                 str(self.dynamic_strength_combo.currentData()),
+                self.low_light_enhancement_checkbox.isChecked(),
             )
             self.settings.setValue("colmap_path", self.colmap_path_edit.text().strip())
             self.statusBar().showMessage(f"正在重建：{workspace}")
@@ -343,6 +355,7 @@ class MainWindow(QMainWindow):
         self.start_reconstruction_button.setEnabled(not running)
         self.cancel_reconstruction_button.setEnabled(running)
         self.dynamic_suppression_checkbox.setEnabled(not running)
+        self.low_light_enhancement_checkbox.setEnabled(not running)
         self.dynamic_strength_combo.setEnabled(
             not running and self.dynamic_suppression_checkbox.isChecked()
         )
@@ -351,6 +364,21 @@ class MainWindow(QMainWindow):
         self.reconstruction_progress.setFormat("重建未完成")
         self.statusBar().showMessage(message)
         QMessageBox.warning(self, "重建未完成", message)
+
+    def _review_dynamic_dataset(
+        self, phase: str, image_directory: str, mask_directory: str
+    ) -> None:
+        title = (
+            "第一次复核：修正自动检测的动态区域"
+            if phase == "review_initial"
+            else "第二次复核：检查恢复后的静态图片"
+        )
+        dialog = DynamicReviewDialog(
+            Path(image_directory), Path(mask_directory), phase=phase,
+            title=title, parent=self
+        )
+        accepted = dialog.exec() == dialog.DialogCode.Accepted
+        self.colmap_runner.resume_after_review(accepted)
 
     def _reconstruction_completed(self, result: ReconstructionResult) -> None:
         self.reconstruction_progress.setValue(self.reconstruction_progress.maximum())

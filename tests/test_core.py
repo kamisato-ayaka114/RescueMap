@@ -31,6 +31,7 @@ from rescuemap.core.dynamic_mask import (
     _edge_aware_region_mask,
     _point_level_dynamic_mask,
 )
+from rescuemap.core.image_preprocess import enhance_low_light_dataset
 from rescuemap.core.terrain import (
     ACCEPTED,
     FILL_AUTO,
@@ -48,6 +49,21 @@ from rescuemap.core.terrain_mesh import build_terrain_mesh
 
 
 class DynamicSuppressionTests(unittest.TestCase):
+    def test_low_light_enhancement_preserves_structure_and_brightens_dark_detail(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source"
+            output = root / "output"
+            (source / "nested").mkdir(parents=True)
+            dark = np.tile(np.arange(20, 84, dtype=np.uint8), (32, 1))
+            rgb = np.repeat(dark[:, :, None], 3, axis=2)
+            Image.fromarray(rgb).save(source / "nested" / "frame.png")
+            summary = enhance_low_light_dataset(source, output)
+            enhanced = np.asarray(Image.open(output / "nested" / "frame.png"))
+            self.assertEqual(summary.image_count, 1)
+            self.assertEqual(enhanced.shape, rgb.shape)
+            self.assertGreater(float(enhanced.std()), float(rgb.std()))
+
     def test_texture_correlation_is_brightness_offset_invariant(self):
         first = np.array([[20, 40, 60], [80, 100, 120], [40, 60, 80]], dtype=float)
         second = first + 35.0
@@ -219,11 +235,27 @@ class CandidateValidationTests(unittest.TestCase):
                 True,
             )
 
-            self.assertEqual(len(stages), 11)
+            self.assertEqual(len(stages), 15)
             self.assertEqual(stages[3].kind, "generate_masks")
-            formal_feature = stages[4]
+            self.assertEqual(stages[4].kind, "review_initial")
+            self.assertEqual(stages[5].kind, "complete_backgrounds")
+            self.assertEqual(stages[6].kind, "review_completed")
+            self.assertEqual(stages[7].kind, "complete_final")
+            formal_feature = stages[8]
             self.assertIn("--ImageReader.mask_path", formal_feature.arguments)
             self.assertIn(str(workspace / "static_images"), formal_feature.arguments)
+
+    def test_low_light_enhancement_precedes_preview(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
+            root = Path(temporary_directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            stages = build_colmap_stages(
+                root / "colmap.exe", root / "images", workspace,
+                "standard", True, True,
+            )
+            self.assertEqual(stages[0].kind, "enhance_images")
+            self.assertIn(str(workspace / "enhanced_images"), stages[1].arguments)
 
 
 class CalibrationTests(unittest.TestCase):
