@@ -18,8 +18,9 @@ from rescuemap.core.background_completion import (
     _normalised_correlation,
     _project_homography,
     _robust_homography,
+    _texture_adaptive_boundary_fill,
 )
-from rescuemap.core.colmap_runner import build_colmap_stages
+from rescuemap.core.colmap_runner import ColmapRunner, build_colmap_stages
 from rescuemap.core.candidate_validation import (
     ColmapCamera,
     ColmapImage,
@@ -51,6 +52,52 @@ from rescuemap.core.terrain_mesh import build_terrain_mesh
 
 
 class DynamicSuppressionTests(unittest.TestCase):
+    def test_human_refinement_unmasks_repaired_pixels_for_colmap(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
+            workspace = Path(temporary_directory)
+            (workspace / "dynamic_masks").mkdir()
+            (workspace / "refinement_masks").mkdir()
+            dynamic = np.zeros((12, 16), dtype=np.uint8)
+            refinement = np.full((12, 16), 255, dtype=np.uint8)
+            refinement[3:9, 5:12] = 0
+            Image.fromarray(dynamic).save(workspace / "dynamic_masks" / "frame.jpg.png")
+            Image.fromarray(refinement).save(
+                workspace / "refinement_masks" / "frame.jpg.png"
+            )
+
+            ColmapRunner._accept_refined_pixels(workspace)
+
+            updated = np.asarray(
+                Image.open(workspace / "dynamic_masks" / "frame.jpg.png")
+            )
+            self.assertTrue(np.all(updated[3:9, 5:12] == 255))
+            self.assertEqual(int(np.count_nonzero(updated)), 6 * 7)
+
+    def test_texture_adaptive_fill_preserves_nonuniform_texture(self):
+        height, width = 72, 96
+        yy, xx = np.indices((height, width))
+        texture = 90 + 35 * np.sin(xx / 3.0) + 18 * np.sin((xx + yy) / 5.0)
+        rgb = np.repeat(np.clip(texture, 0, 255)[:, :, None], 3, axis=2).astype(np.uint8)
+        hole = np.zeros((height, width), dtype=bool)
+        hole[20:54, 30:68] = True
+
+        values, strong = _texture_adaptive_boundary_fill(rgb, hole)
+
+        self.assertTrue(strong)
+        self.assertGreater(float(values.std()), 4.0)
+        self.assertGreater(np.unique(values[:, 0]).size, 12)
+
+    def test_texture_adaptive_fill_uses_weak_boundary_majority(self):
+        rgb = np.full((60, 80, 3), [108, 92, 76], dtype=np.uint8)
+        rgb[:8] = np.array([20, 30, 150], dtype=np.uint8)
+        hole = np.zeros((60, 80), dtype=bool)
+        hole[20:42, 24:58] = True
+
+        values, strong = _texture_adaptive_boundary_fill(rgb, hole)
+
+        self.assertFalse(strong)
+        np.testing.assert_allclose(values.mean(axis=0), [108, 92, 76], atol=3.0)
+
     def test_directional_boundary_fill_uses_surrounding_texture(self):
         height, width = 50, 70
         x = np.arange(width, dtype=np.uint8)[None, :]

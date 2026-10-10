@@ -160,9 +160,17 @@ class DynamicReviewDialog(QDialog):
         for index, path in enumerate(self.paths):
             relative = str(path.relative_to(self.image_directory)).replace("\\", "/")
             count = automatic.get(relative, 0)
-            prefix = f"● 算法{count}处" if count > 0 else "○ 未检出"
+            if self.phase == "review_initial":
+                prefix = f"● 算法{count}处" if count > 0 else "○ 未检出"
+            else:
+                mask_path = self.mask_directory / (relative + ".png")
+                selected = False
+                if mask_path.is_file():
+                    with Image.open(mask_path) as opened:
+                        selected = bool(np.any(np.asarray(opened.convert("L")) <= 127))
+                prefix = "● 已选平滑区" if selected else "○ 无需处理"
             item = QListWidgetItem(f"{prefix} | {relative}")
-            if count > 0:
+            if count > 0 or (self.phase != "review_initial" and selected):
                 item.setForeground(QColor("#d62828"))
                 if first_detected < 0:
                     first_detected = index
@@ -171,19 +179,32 @@ class DynamicReviewDialog(QDialog):
         self.canvas = _MaskCanvas()
         self.canvas.changed.connect(self._mark_dirty)
         detected_count = sum(value > 0 for value in automatic.values())
-        help_label = QLabel(
-            f"算法已在 {detected_count}/{len(self.paths)} 张图片中生成初始动态候选框。"
-            "红框是算法初标或人工补充；左键拖框添加，右键单击框内删除。\n"
-            "左侧“未检出”只表示算法没有足够证据，仍需人工检查。切换图片时自动保存。\n"
-            "保存继续后，掩膜、带框图片和框坐标会留在本次工程中，下次可直接续跑。"
-        )
+        if self.phase == "review_initial":
+            help_text = (
+                f"算法已在 {detected_count}/{len(self.paths)} 张图片中生成初始动态候选框。"
+                "红框是算法初标或人工补充；左键拖框添加，右键单击框内删除。\n"
+                "左侧“未检出”只表示算法没有足够证据，仍需人工检查。切换图片时自动保存。\n"
+                "保存继续后，掩膜、带框图片和框坐标会留在本次工程中，下次可直接续跑。"
+            )
+        else:
+            help_text = (
+                "跨帧静态背景拼接已经完成。这里只框选仍需局部补全或接缝平滑的区域；"
+                "未框选部分将原样保留。\n"
+                "左键拖框选择，右键单击红框删除；算法会根据四周边界纹理补全，"
+                "并只在选区内侧边缘做高斯羽化。切换图片时自动保存。\n"
+                "选区和带框图片会保存在工程中，之后可以从本步骤继续，无需重新检测。"
+            )
+        help_label = QLabel(help_text)
         help_label.setWordWrap(True)
         help_label.setStyleSheet("background:#fff3b0;color:#202020;padding:8px;border:1px solid #d6a800;")
         previous_button = QPushButton("上一张")
         next_button = QPushButton("下一张")
         previous_button.clicked.connect(lambda: self.list_widget.setCurrentRow(max(0, self.current_index - 1)))
         next_button.clicked.connect(lambda: self.list_widget.setCurrentRow(min(len(self.paths)-1, self.current_index + 1)))
-        accept_button = QPushButton("保存复核结果并继续")
+        accept_button = QPushButton(
+            "保存动态框并继续" if self.phase == "review_initial"
+            else "应用所选补全与平滑区域"
+        )
         cancel_button = QPushButton("取消本次重建")
         accept_button.clicked.connect(self._accept)
         cancel_button.clicked.connect(self.reject)

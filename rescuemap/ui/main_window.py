@@ -133,6 +133,8 @@ class MainWindow(QMainWindow):
         self.last_preprocessing_result: PreprocessingResult | None = None
         self.processing_wait_dialog: QProgressDialog | None = None
         self.processing_wait_title = ""
+        self.processing_photo_current = 0
+        self.processing_photo_total = 0
         self.processing_elapsed = QElapsedTimer()
         self.processing_timer = QTimer(self)
         self.processing_timer.setInterval(1000)
@@ -153,6 +155,7 @@ class MainWindow(QMainWindow):
         self.colmap_runner.preprocessing_completed.connect(
             self._preprocessing_completed
         )
+        self.colmap_runner.photo_progress.connect(self._update_photo_progress)
 
         self.plotter = QtInteractor(self)
         self.plotter.set_background("#20252b")
@@ -503,6 +506,8 @@ class MainWindow(QMainWindow):
 
     def _show_processing_wait_dialog(self, title: str) -> None:
         self.processing_wait_title = title
+        self.processing_photo_current = 0
+        self.processing_photo_total = 0
         self.processing_elapsed.start()
         dialog = QProgressDialog(self)
         dialog.setWindowTitle("照片处理中")
@@ -524,9 +529,22 @@ class MainWindow(QMainWindow):
         seconds = max(0, self.processing_elapsed.elapsed() // 1000)
         minutes, remainder = divmod(seconds, 60)
         elapsed_text = f"{minutes} 分 {remainder} 秒" if minutes else f"{remainder} 秒"
-        self.processing_wait_dialog.setLabelText(
-            f"{self.processing_wait_title}\n已耗时 {elapsed_text}，请稍候……"
+        count_text = (
+            f"\n已完成 {self.processing_photo_current}/{self.processing_photo_total} 张"
+            if self.processing_photo_total else ""
         )
+        self.processing_wait_dialog.setLabelText(
+            f"{self.processing_wait_title}{count_text}\n已耗时 {elapsed_text}，请稍候……"
+        )
+
+    def _update_photo_progress(self, current: int, total: int, title: str) -> None:
+        self.processing_photo_current = current
+        self.processing_photo_total = total
+        self.processing_wait_title = title
+        if self.processing_wait_dialog is not None:
+            self.processing_wait_dialog.setRange(0, total)
+            self.processing_wait_dialog.setValue(current)
+        self._update_processing_wait_dialog()
 
     def _hide_processing_wait_dialog(self) -> None:
         self.processing_timer.stop()

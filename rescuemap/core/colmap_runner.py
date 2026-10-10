@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 import sys
 
+import numpy as np
+from PIL import Image
 from PySide6.QtCore import QObject, QProcess, QThread, QTimer, Signal, Slot
 
 from rescuemap.core.background_completion import complete_dynamic_backgrounds
@@ -289,6 +291,7 @@ class ColmapRunner(QObject):
     enhancement_review_requested = Signal(str, str)
     final_review_requested = Signal(str, str)
     preprocessing_completed = Signal(object)
+    photo_progress = Signal(int, int, str)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -555,8 +558,12 @@ class ColmapRunner(QObject):
                 if stage.kind == "review_initial"
                 else self._workspace / "static_images"
             )
+            mask_directory = self._workspace / "dynamic_masks"
+            if stage.kind == "review_completed":
+                mask_directory = self._workspace / "refinement_masks"
+                self._prepare_refinement_masks(image_directory, mask_directory)
             self.review_requested.emit(
-                stage.kind, str(image_directory), str(self._workspace / "dynamic_masks")
+                stage.kind, str(image_directory), str(mask_directory)
             )
             return
         if stage.kind == "review_final_static":
@@ -723,6 +730,46 @@ class ColmapRunner(QObject):
             f"{summary.low_percentile:.1f}～{summary.high_percentile:.1f}，原图未修改。\n"
         )
 
+    @staticmethod
+    def _prepare_refinement_masks(
+        image_directory: Path, mask_directory: Path
+    ) -> None:
+        """Create persistent empty masks for user-selected seam refinement."""
+        mask_directory.mkdir(parents=True, exist_ok=True)
+        for image_path in image_directory.rglob("*"):
+            if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_SUFFIXES:
+                continue
+            relative = image_path.relative_to(image_directory)
+            target = mask_directory / (str(relative) + ".png")
+            if target.is_file():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with Image.open(image_path) as opened:
+                Image.new("L", opened.size, 255).save(target)
+
+    @staticmethod
+    def _accept_refined_pixels(workspace: Path) -> None:
+        """Allow human-approved repaired pixels in the formal COLMAP pass."""
+        refinement_root = workspace / "refinement_masks"
+        dynamic_root = workspace / "dynamic_masks"
+        if not refinement_root.is_dir() or not dynamic_root.is_dir():
+            return
+        for refinement_path in refinement_root.rglob("*.png"):
+            relative = refinement_path.relative_to(refinement_root)
+            dynamic_path = dynamic_root / relative
+            if not dynamic_path.is_file():
+                continue
+            with Image.open(refinement_path) as opened:
+                selected = np.asarray(opened.convert("L")) <= 127
+            if not selected.any():
+                continue
+            with Image.open(dynamic_path) as opened:
+                dynamic_static = np.asarray(opened.convert("L")).copy()
+            if dynamic_static.shape != selected.shape:
+                continue
+            dynamic_static[selected] = 255
+            Image.fromarray(dynamic_static.astype(np.uint8)).save(dynamic_path)
+
     def _complete_dynamic_backgrounds(self, *, final: bool) -> None:
         assert self._workspace is not None
         assert self._processing_image_directory is not None
@@ -735,10 +782,15 @@ class ColmapRunner(QObject):
             if final or self._resume_from_static
             else self._processing_image_directory
         )
+        mask_directory = self._workspace / (
+            "refinement_masks" if final else "dynamic_masks"
+        )
+        if final:
+            self._prepare_refinement_masks(source_directory, mask_directory)
         completion = complete_dynamic_backgrounds(
             self._workspace / "dynamic_preview" / "database.db",
             source_directory,
-            self._workspace / "dynamic_masks",
+            mask_directory,
             self._workspace / "static_images",
             preview_directory=self._workspace / (
                 "final_background_previews" if final else "background_completion_previews"
@@ -746,18 +798,32 @@ class ColmapRunner(QObject):
             report_path=self._workspace / (
                 "final_background_report.json" if final else "background_completion_report.json"
             ),
+            mode="refine" if final else "multiview",
+            progress_callback=lambda current, total: self.photo_progress.emit(
+                current, total,
+                "人工选区纹理补全与边界平滑" if final else "跨帧拼接静态背景",
+            ),
+            should_cancel=lambda: self._cancelled,
         )
-        self.log_received.emit(
-            f"{'最终' if final else '首次'}多视角背景恢复："
-            f"{completion.completed_images} 张照片获得可信补全，"
-            f"补全 {completion.completed_pixels}/{completion.dynamic_pixels} 个动态像素，"
-            f"其中强纹理延伸 {completion.strong_texture_pixels}，"
-            f"弱纹理投影验证 {completion.weak_texture_pixels}；"
-            f"周围纹理延伸 {completion.local_texture_pixels}，"
-            f"小空洞稳健填充 {completion.small_hole_pixels}；"
-            f"近景地面优先填充 {completion.near_side_pixels}；"
-            f"其余 {completion.unresolved_pixels} 个像素保持屏蔽。\n"
-        )
+        if final and not self._cancelled:
+            self._accept_refined_pixels(self._workspace)
+        if final:
+            self.log_received.emit(
+                "人工选区补全与平滑："
+                f"处理 {completion.completed_images} 张照片，"
+                f"共 {completion.completed_pixels} 个选中像素；"
+                f"强纹理二维延伸 {completion.local_texture_pixels}，"
+                f"弱纹理边界多数填充 {completion.small_hole_pixels}。\n"
+            )
+        else:
+            self.log_received.emit(
+                "首次跨帧背景拼接："
+                f"{completion.completed_images} 张照片获得可信拼接，"
+                f"补全 {completion.completed_pixels}/{completion.dynamic_pixels} 个动态像素，"
+                f"其中强纹理一致区域 {completion.strong_texture_pixels}，"
+                f"弱纹理几何一致区域 {completion.weak_texture_pixels}；"
+                f"其余 {completion.unresolved_pixels} 个像素留给人工复核。\n"
+            )
 
     def _process_error(self, error) -> None:
         if self._cancelled:

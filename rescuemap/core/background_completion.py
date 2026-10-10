@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 from pathlib import Path
 import sqlite3
+from typing import Callable
 
 import numpy as np
 from PIL import Image
@@ -77,9 +79,17 @@ def _robust_homography(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarr
     target = np.asarray(target, dtype=float)
     if len(source) < 6:
         raise ValueError("局部有效匹配少于6对。")
+    # Local RANSAC used to run as many as 240 SVD fits for every dynamic
+    # component and every neighbouring frame.  A deterministic, spatially
+    # distributed subset and 64 trials retain the useful outlier rejection
+    # while making a 70-frame review practical on an integrated GPU laptop.
+    if len(source) > 120:
+        keep = np.linspace(0, len(source) - 1, 120).astype(int)
+        source = source[keep]
+        target = target[keep]
     rng = np.random.default_rng(20261010)
     best = np.zeros(len(source), dtype=bool)
-    for _ in range(min(240, max(80, len(source) * 3))):
+    for _ in range(min(64, max(32, len(source)))):
         indices = rng.choice(len(source), 4, replace=False)
         try:
             matrix = _normalised_homography(source[indices], target[indices])
@@ -93,6 +103,29 @@ def _robust_homography(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarr
     if best.sum() < 6:
         raise ValueError("局部投影没有足够内点。")
     return _normalised_homography(source[best], target[best]), float(best.mean())
+
+
+class _FrameCache:
+    """Small LRU cache for neighbouring RGB frames and masks.
+
+    A frame was previously decoded again for every candidate component.  The
+    sequential matcher only uses nearby images, so a bounded cache removes the
+    repeated disk/JPEG cost without retaining the complete dataset in memory.
+    """
+
+    def __init__(self, image_directory: Path, mask_directory: Path) -> None:
+        self.image_directory = image_directory
+        self.mask_directory = mask_directory
+
+    @lru_cache(maxsize=10)
+    def rgb(self, relative_name: str) -> np.ndarray:
+        with Image.open(self.image_directory / Path(relative_name)) as opened:
+            return np.asarray(opened.convert("RGB")).copy()
+
+    @lru_cache(maxsize=10)
+    def static(self, relative_name: str) -> np.ndarray:
+        with Image.open(self.mask_directory / (relative_name + ".png")) as opened:
+            return np.asarray(opened.convert("L")) > 127
 
 
 def _load_pair_geometry(database_path: Path, neighbor_span: int = 3):
@@ -256,6 +289,73 @@ def _directional_boundary_fill(
     return np.clip(filled[local_y, local_x], 0, 255).astype(np.uint8)
 
 
+def _texture_adaptive_boundary_fill(
+    rgb: np.ndarray, hole: np.ndarray
+) -> tuple[np.ndarray, bool]:
+    """Fill a selected region from its complete two-dimensional boundary.
+
+    The low-frequency colour field is obtained by a discrete harmonic-style
+    diffusion with every visible boundary pixel held fixed.  For a textured
+    boundary, only the high-frequency residual is transported along the local
+    structure direction; this avoids the large vertical colour bars produced
+    by extending raw RGB columns.  A weak-texture boundary instead contributes
+    its dominant quantised colour, which is robust to isolated lamps and cars.
+    """
+    rgb_float = np.asarray(rgb, dtype=float)
+    hole = np.asarray(hole, dtype=bool)
+    ys, xs = np.where(hole)
+    if not len(xs):
+        return np.empty((0, 3), dtype=np.uint8), False
+
+    margin = max(12, min(64, int(np.sqrt(len(xs))) // 2 + 8))
+    y0, y1 = max(0, ys.min() - margin), min(hole.shape[0], ys.max() + margin + 1)
+    x0, x1 = max(0, xs.min() - margin), min(hole.shape[1], xs.max() + margin + 1)
+    local_hole = hole[y0:y1, x0:x1]
+    local_rgb = rgb_float[y0:y1, x0:x1]
+    ring = binary_dilation(local_hole, iterations=min(6, margin)) & ~local_hole
+
+    gray = local_rgb @ np.array([0.299, 0.587, 0.114])
+    gy, gx = np.gradient(gray)
+    texture_strength = (
+        float(np.percentile(np.hypot(gx[ring], gy[ring]), 65))
+        if ring.any() else 0.0
+    )
+    strong_texture = texture_strength >= 8.0
+
+    # Nearest-boundary initialisation followed by fixed-boundary diffusion is
+    # a fast approximation to a Laplace solution with full 2-D constraints.
+    _, nearest = distance_transform_edt(local_hole, return_indices=True)
+    work = local_rgb.copy()
+    work[local_hole] = local_rgb[nearest[0][local_hole], nearest[1][local_hole]]
+    iterations = min(48, max(12, int(np.sqrt(int(local_hole.sum()))) // 5))
+    for _ in range(iterations):
+        smoothed = gaussian_filter(work, sigma=(1.05, 1.05, 0.0), mode="nearest")
+        work[local_hole] = smoothed[local_hole]
+
+    if strong_texture:
+        low_frequency = gaussian_filter(local_rgb, sigma=(2.0, 2.0, 0.0), mode="nearest")
+        shifted_residual = np.clip(local_rgb - low_frequency + 128.0, 0, 255)
+        residual_values = (
+            _directional_boundary_fill(shifted_residual.astype(np.uint8), local_hole)
+            .astype(float) - 128.0
+        )
+        ly, lx = np.where(local_hole)
+        texture_weight = float(np.clip(texture_strength / 42.0, 0.25, 0.72))
+        work[ly, lx] += texture_weight * residual_values
+    elif ring.any():
+        # "Most common surrounding pixel" is estimated in 16-level colour
+        # bins so sensor noise does not make every RGB triplet unique.
+        samples = local_rgb[ring]
+        quantised = np.clip(samples // 16, 0, 15).astype(np.int16)
+        codes = quantised[:, 0] * 256 + quantised[:, 1] * 16 + quantised[:, 2]
+        dominant = int(np.bincount(codes, minlength=4096).argmax())
+        dominant_colour = samples[codes == dominant].mean(axis=0)
+        work[local_hole] = 0.78 * work[local_hole] + 0.22 * dominant_colour
+
+    ly, lx = np.where(local_hole)
+    return np.clip(work[ly, lx], 0, 255).astype(np.uint8), strong_texture
+
+
 def _near_side_ground_fill(rgb: np.ndarray, hole: np.ndarray) -> np.ndarray:
     """Fill from the lower/near-side boundary for forward-looking images."""
     rgb = np.asarray(rgb, dtype=float)
@@ -305,24 +405,36 @@ def complete_dynamic_backgrounds(
     *,
     preview_directory: Path,
     report_path: Path,
+    mode: str = "multiview",
+    progress_callback: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> CompletionSummary:
-    """Fill dynamic regions only when two geometrically aligned donor views agree."""
+    """Restore dynamic regions by multiview stitching or manual refinement."""
+    if mode not in {"multiview", "refine"}:
+        raise ValueError(f"未知的背景恢复模式：{mode}")
     names, pairs = _load_pair_geometry(database_path)
+    cache = _FrameCache(image_directory, mask_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
     preview_directory.mkdir(parents=True, exist_ok=True)
     total_dynamic = total_completed = completed_images = 0
     total_strong = total_weak = 0
     total_local_texture = total_small_hole = total_near_side = 0
     image_reports = []
-    for image_id, relative_name in names.items():
-        source_path = image_directory / Path(relative_name)
+    total_images = len(names)
+    for image_number, (image_id, relative_name) in enumerate(names.items(), start=1):
+        if should_cancel is not None and should_cancel():
+            break
         mask_path = mask_directory / (relative_name + ".png")
-        rgb = np.asarray(Image.open(source_path).convert("RGB")).copy()
-        static_mask = np.asarray(Image.open(mask_path).convert("L")) > 127
-        # Close tiny omissions in a hand-drawn box and include a one-pixel
-        # safety rim.  The original/manual annotation dataset is saved before
-        # this processing, so this cleanup never destroys the user's labels.
-        dynamic = binary_dilation(binary_closing(~static_mask, iterations=2), iterations=2)
+        rgb = cache.rgb(relative_name).copy()
+        static_mask = cache.static(relative_name)
+        # Manual refinement honours the selected rectangle exactly.  Automatic
+        # dynamic masks receive a tiny closing operation but are no longer
+        # enlarged, because expansion was erasing good boundary texture.
+        dynamic = (
+            ~static_mask
+            if mode == "refine"
+            else binary_closing(~static_mask, iterations=1)
+        )
         completed = np.zeros_like(dynamic)
         completed_strong = np.zeros_like(dynamic)
         completed_weak = np.zeros_like(dynamic)
@@ -333,7 +445,37 @@ def complete_dynamic_backgrounds(
         gray = rgb.astype(float) @ np.array([0.299, 0.587, 0.114])
         gradient = np.hypot(*np.gradient(gray))
         labels, component_count = label(dynamic)
-        for component_id in range(1, component_count + 1):
+        if mode == "refine":
+            for component_id in range(1, component_count + 1):
+                component = labels == component_id
+                ys, xs = np.where(component)
+                if not len(xs):
+                    continue
+                values, strong_texture = _texture_adaptive_boundary_fill(result, component)
+                result[ys, xs] = values
+                completed[ys, xs] = True
+                if strong_texture:
+                    completed_local_texture[ys, xs] = True
+                else:
+                    completed_small_hole[ys, xs] = True
+
+            # Gaussian filtering is deliberately restricted to the inner seam
+            # of regions selected by the user.  It blends the join but never
+            # turns the whole object into a uniform patch.
+            seam = completed & ~binary_erosion(completed, iterations=3)
+            if seam.any():
+                smoothed = gaussian_filter(result.astype(float), sigma=(1.0, 1.0, 0.0))
+                result[seam] = np.clip(
+                    0.62 * result[seam] + 0.38 * smoothed[seam], 0, 255
+                ).astype(np.uint8)
+
+        if mode == "multiview":
+            # First pass intentionally retains the earlier conservative
+            # behaviour: only geometrically verified neighbouring views may
+            # replace a moving object.  Local synthesis is deferred until the
+            # user explicitly selects a region in the second review.
+            pass
+        for component_id in (range(1, component_count + 1) if mode == "multiview" else ()):
             component = labels == component_id
             ys, xs = np.where(component)
             if len(xs) < 16:
@@ -365,8 +507,8 @@ def complete_dynamic_backgrounds(
                 except ValueError:
                     continue
                 donor_name = names[geometry.other_id]
-                donor_rgb = np.asarray(Image.open(image_directory / Path(donor_name)).convert("RGB"))
-                donor_static = np.asarray(Image.open(mask_directory / (donor_name + ".png")).convert("L")) > 127
+                donor_rgb = cache.rgb(donor_name)
+                donor_static = cache.static(donor_name)
                 projected_ring = _project_homography(ring_points, matrix)
                 ring_valid = ((projected_ring[:, 0] >= 1) & (projected_ring[:, 0] < donor_rgb.shape[1]-1)
                               & (projected_ring[:, 1] >= 1) & (projected_ring[:, 1] < donor_rgb.shape[0]-1))
@@ -426,75 +568,16 @@ def complete_dynamic_backgrounds(
                 completed_strong[ys[accepted], xs[accepted]] = True
             else:
                 completed_weak[ys[accepted], xs[accepted]] = True
-            component_centre_y = float(np.mean(ys)) / max(dynamic.shape[0] - 1, 1)
-            lower_ring_count = int(np.count_nonzero(ring & (
-                np.indices(ring.shape)[0] >= np.mean(ys)
-            )))
-            ground_like = component_centre_y >= 0.38 and lower_ring_count >= 12
-            if ground_like and accepted.any():
-                near_values = _near_side_ground_fill(rgb, component)
-                disagreement = np.mean(
-                    np.abs(median - near_values.astype(float)), axis=1
-                )
-                replace = accepted & (disagreement > 34.0)
-                result[ys[replace], xs[replace]] = near_values[replace]
-                completed_near_side[ys[replace], xs[replace]] = True
-                completed_strong[ys[replace], xs[replace]] = False
-                completed_weak[ys[replace], xs[replace]] = False
-        # Multi-view evidence remains the preferred source.  For unresolved
-        # components, use a bounded single-image fallback instead of leaving
-        # every pixel black.  Large/edge-touching holes stay masked because a
-        # plausible-looking texture there would be mostly invented.
-        unresolved_before_fallback = dynamic & ~completed
-        fallback_labels, fallback_count = label(unresolved_before_fallback)
-        image_area = int(dynamic.size)
-        small_limit = max(96, int(image_area * 0.00012))
-        medium_limit = max(6000, int(image_area * 0.035))
-        for fallback_id in range(1, fallback_count + 1):
-            hole = fallback_labels == fallback_id
-            hole_count = int(hole.sum())
-            if hole_count == 0:
-                continue
-            hy, hx = np.where(hole)
-            touches_edge = (
-                hy.min() == 0 or hx.min() == 0
-                or hy.max() == dynamic.shape[0] - 1
-                or hx.max() == dynamic.shape[1] - 1
-            )
-            centre_y = float(np.mean(hy)) / max(dynamic.shape[0] - 1, 1)
-            near_side_limit = max(medium_limit, int(image_area * 0.08))
-            if centre_y >= 0.38 and hole_count <= near_side_limit and not touches_edge:
-                values = _near_side_ground_fill(result, hole)
-                result[hy, hx] = values
-                completed[hy, hx] = True
-                completed_near_side[hy, hx] = True
-            elif hole_count <= small_limit:
-                values = _directional_boundary_fill(result, hole, use_median=True)
-                result[hy, hx] = values
-                completed[hy, hx] = True
-                completed_small_hole[hy, hx] = True
-            elif hole_count <= medium_limit and not touches_edge:
-                values = _directional_boundary_fill(result, hole, use_median=False)
-                result[hy, hx] = values
-                completed[hy, hx] = True
-                completed_local_texture[hy, hx] = True
-        # Feather only the inner edge of repaired regions.  Static pixels
-        # outside the annotation are never overwritten, while one-pixel gaps
-        # and hard rectangular seams are softened.
-        completed_boundary = completed & ~binary_erosion(completed, iterations=2)
-        if completed_boundary.any():
-            smoothed = gaussian_filter(result.astype(float), sigma=(0.9, 0.9, 0.0))
-            result[completed_boundary] = np.clip(
-                smoothed[completed_boundary], 0, 255
-            ).astype(np.uint8)
         unresolved = dynamic & ~completed
-        result[unresolved] = 0
+        if mode == "multiview":
+            result[unresolved] = 0
         updated_mask = np.where(unresolved, 0, 255).astype(np.uint8)
         target = output_directory / Path(relative_name)
         target.parent.mkdir(parents=True, exist_ok=True)
         options = {"quality": 95, "subsampling": 0} if target.suffix.lower() in {".jpg", ".jpeg"} else {}
         Image.fromarray(result).save(target, **options)
-        Image.fromarray(updated_mask).save(mask_path)
+        if mode == "multiview":
+            Image.fromarray(updated_mask).save(mask_path)
         preview = rgb.copy()
         preview[completed_strong] = (
             0.35 * preview[completed_strong] + 0.65 * np.array([30, 220, 80])
@@ -538,15 +621,19 @@ def complete_dynamic_backgrounds(
                               "near_side_completed_pixels": near_side_count,
                               "unresolved_pixels": dynamic_count-completed_count,
                               "completion_ratio": completed_count/max(dynamic_count, 1)})
-    report_path.write_text(json.dumps({"method": "hybrid_multiview_directional_completion",
-        "fallback_policy": {
-            "small_hole": "robust_median_of_directional_boundary_samples",
-            "medium_hole": "texture_orientation_weighted_boundary_extension",
-            "large_or_border_hole": "keep_masked",
-            "forward_ground": "lower_near_side_trimmed_mean_and_ray_extension",
-            "small_area_ratio": 0.00012,
-            "medium_area_ratio": 0.035,
-        },
+        if progress_callback is not None:
+            progress_callback(image_number, total_images)
+    report_path.write_text(json.dumps({
+        "method": (
+            "conservative_multiview_stitching"
+            if mode == "multiview"
+            else "manual_texture_adaptive_boundary_refinement"
+        ),
+        "refinement_policy": {
+            "strong_texture": "harmonic_colour_field_plus_directional_high_frequency_residual",
+            "weak_texture": "full_boundary_diffusion_plus_dominant_quantised_colour",
+            "seam": "inner_three_pixel_gaussian_feather",
+        } if mode == "refine" else None,
         "summary": {"dynamic_pixels": total_dynamic, "completed_pixels": total_completed,
                     "strong_texture_completed_pixels": total_strong,
                     "weak_texture_completed_pixels": total_weak,
