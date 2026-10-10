@@ -444,6 +444,8 @@ class ColmapRunner(QObject):
             "掩膜预览与逐图统计已经保存，不确定区域继续保留。\n"
             f"多视角背景互补：{completion.completed_images} 张照片获得可信补全，"
             f"补全 {completion.completed_pixels}/{completion.dynamic_pixels} 个动态像素，"
+            f"其中强纹理延伸 {completion.strong_texture_pixels}，"
+            f"弱纹理投影验证 {completion.weak_texture_pixels}；"
             f"其余 {completion.unresolved_pixels} 个像素保持屏蔽。\n"
         )
 

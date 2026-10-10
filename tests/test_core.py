@@ -13,6 +13,7 @@ from rescuemap.core.calibration import (
     uniform_scale_transform,
 )
 from rescuemap.core.background_completion import (
+    _normalised_correlation,
     _project_homography,
     _robust_homography,
 )
@@ -47,6 +48,11 @@ from rescuemap.core.terrain_mesh import build_terrain_mesh
 
 
 class DynamicSuppressionTests(unittest.TestCase):
+    def test_texture_correlation_is_brightness_offset_invariant(self):
+        first = np.array([[20, 40, 60], [80, 100, 120], [40, 60, 80]], dtype=float)
+        second = first + 35.0
+        self.assertGreater(_normalised_correlation(first, second), 0.999)
+
     def test_robust_homography_recovers_view_projection_with_outlier(self):
         source = np.array(
             [[0, 0], [10, 0], [0, 10], [10, 10], [4, 3], [7, 8], [2, 6]],

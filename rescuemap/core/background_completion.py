@@ -18,6 +18,8 @@ class CompletionSummary:
     completed_pixels: int
     unresolved_pixels: int
     completed_images: int
+    strong_texture_pixels: int
+    weak_texture_pixels: int
     report_path: Path
 
 
@@ -120,6 +122,17 @@ def _sample_rgb(rgb: np.ndarray, points: np.ndarray) -> np.ndarray:
     ])
 
 
+def _normalised_correlation(first: np.ndarray, second: np.ndarray) -> float:
+    first_gray = np.asarray(first, dtype=float) @ np.array([0.299, 0.587, 0.114])
+    second_gray = np.asarray(second, dtype=float) @ np.array([0.299, 0.587, 0.114])
+    first_gray -= first_gray.mean()
+    second_gray -= second_gray.mean()
+    denominator = float(np.linalg.norm(first_gray) * np.linalg.norm(second_gray))
+    if denominator < 1e-9:
+        return 0.0
+    return float(np.clip(np.dot(first_gray, second_gray) / denominator, -1.0, 1.0))
+
+
 def complete_dynamic_backgrounds(
     database_path: Path,
     image_directory: Path,
@@ -134,6 +147,7 @@ def complete_dynamic_backgrounds(
     output_directory.mkdir(parents=True, exist_ok=True)
     preview_directory.mkdir(parents=True, exist_ok=True)
     total_dynamic = total_completed = completed_images = 0
+    total_strong = total_weak = 0
     image_reports = []
     for image_id, relative_name in names.items():
         source_path = image_directory / Path(relative_name)
@@ -142,7 +156,11 @@ def complete_dynamic_backgrounds(
         static_mask = np.asarray(Image.open(mask_path).convert("L")) > 127
         dynamic = ~static_mask
         completed = np.zeros_like(dynamic)
+        completed_strong = np.zeros_like(dynamic)
+        completed_weak = np.zeros_like(dynamic)
         result = rgb.copy()
+        gray = rgb.astype(float) @ np.array([0.299, 0.587, 0.114])
+        gradient = np.hypot(*np.gradient(gray))
         labels, component_count = label(dynamic)
         for component_id in range(1, component_count + 1):
             component = labels == component_id
@@ -159,6 +177,10 @@ def complete_dynamic_backgrounds(
                 chosen = np.linspace(0, len(ring_x)-1, 300).astype(int)
                 ring_x, ring_y = ring_x[chosen], ring_y[chosen]
             ring_points = np.column_stack((ring_x, ring_y)).astype(float)
+            texture_strength = float(
+                np.clip(np.median(gradient[ring_y, ring_x]) / 24.0, 0.0, 1.0)
+            ) if len(ring_x) else 0.0
+            strong_texture = texture_strength >= 0.35
             candidates = []
             for geometry in pairs.get(image_id, []):
                 local = ((geometry.target_points[:, 0] >= x0) & (geometry.target_points[:, 0] <= x1)
@@ -188,6 +210,11 @@ def complete_dynamic_backgrounds(
                 boundary_error = float(np.median(np.abs(target_ring - (donor_ring + offset))))
                 if boundary_error > 32.0:
                     continue
+                texture_correlation = _normalised_correlation(target_ring, donor_ring + offset)
+                if strong_texture and texture_correlation < 0.45:
+                    continue
+                if not strong_texture and inlier_ratio < 0.55:
+                    continue
                 projected = _project_homography(target_pixels, matrix)
                 valid = ((projected[:, 0] >= 1) & (projected[:, 0] < donor_rgb.shape[1]-1)
                          & (projected[:, 1] >= 1) & (projected[:, 1] < donor_rgb.shape[0]-1))
@@ -196,7 +223,7 @@ def complete_dynamic_backgrounds(
                 valid &= donor_static[iy, ix]
                 colours = np.full((len(target_pixels), 3), np.nan)
                 colours[valid] = np.clip(_sample_rgb(donor_rgb, projected[valid]) + offset, 0, 255)
-                candidates.append((colours, inlier_ratio, boundary_error))
+                candidates.append((colours, inlier_ratio, boundary_error, texture_correlation))
             if len(candidates) < 2:
                 continue
             stack = np.stack([candidate[0] for candidate in candidates])
@@ -209,15 +236,25 @@ def complete_dynamic_backgrounds(
                 np.abs(stack[:, has_candidate, :] - median[None, has_candidate, :]),
                 axis=(0, 2),
             )
-            # Two views are sufficient only when they agree very closely;
-            # looser two-view fusion produced plausible-looking but incorrect
-            # texture fragments in the real overpass sequence.
-            accepted = (
-                ((support >= 3) & (dispersion < 16.0))
-                | ((support == 2) & (dispersion < 8.0))
-            )
+            if strong_texture:
+                # Strong-texture regions extend only texture that remains
+                # correlated on the observed boundary in multiple views.
+                accepted = ((support >= 3) & (dispersion < 18.0)) | (
+                    (support == 2) & (dispersion < 10.0)
+                )
+            else:
+                # Weak texture cannot provide a meaningful NCC decision.  It
+                # therefore relies on projection inliers and tighter colour
+                # agreement between independently projected donor views.
+                accepted = ((support >= 3) & (dispersion < 13.0)) | (
+                    (support == 2) & (dispersion < 7.0)
+                )
             result[ys[accepted], xs[accepted]] = median[accepted].astype(np.uint8)
             completed[ys[accepted], xs[accepted]] = True
+            if strong_texture:
+                completed_strong[ys[accepted], xs[accepted]] = True
+            else:
+                completed_weak[ys[accepted], xs[accepted]] = True
         unresolved = dynamic & ~completed
         result[unresolved] = 0
         updated_mask = np.where(unresolved, 0, 255).astype(np.uint8)
@@ -227,7 +264,12 @@ def complete_dynamic_backgrounds(
         Image.fromarray(result).save(target, **options)
         Image.fromarray(updated_mask).save(mask_path)
         preview = rgb.copy()
-        preview[completed] = (0.35 * preview[completed] + 0.65 * np.array([30, 220, 80])).astype(np.uint8)
+        preview[completed_strong] = (
+            0.35 * preview[completed_strong] + 0.65 * np.array([30, 220, 80])
+        ).astype(np.uint8)
+        preview[completed_weak] = (
+            0.35 * preview[completed_weak] + 0.65 * np.array([40, 180, 245])
+        ).astype(np.uint8)
         preview[unresolved] = (0.25 * preview[unresolved] + 0.75 * np.array([240, 50, 50])).astype(np.uint8)
         preview_target = preview_directory / Path(relative_name)
         preview_target.parent.mkdir(parents=True, exist_ok=True)
@@ -235,15 +277,23 @@ def complete_dynamic_backgrounds(
         dynamic_count, completed_count = int(dynamic.sum()), int(completed.sum())
         total_dynamic += dynamic_count
         total_completed += completed_count
+        strong_count = int(completed_strong.sum())
+        weak_count = int(completed_weak.sum())
+        total_strong += strong_count
+        total_weak += weak_count
         completed_images += int(completed_count > 0)
         image_reports.append({"image": relative_name, "dynamic_pixels": dynamic_count,
                               "completed_pixels": completed_count,
+                              "strong_texture_completed_pixels": strong_count,
+                              "weak_texture_completed_pixels": weak_count,
                               "unresolved_pixels": dynamic_count-completed_count,
                               "completion_ratio": completed_count/max(dynamic_count, 1)})
     report_path.write_text(json.dumps({"method": "local_multiview_background_completion",
         "summary": {"dynamic_pixels": total_dynamic, "completed_pixels": total_completed,
+                    "strong_texture_completed_pixels": total_strong,
+                    "weak_texture_completed_pixels": total_weak,
                     "unresolved_pixels": total_dynamic-total_completed,
                     "completion_ratio": total_completed/max(total_dynamic, 1)},
         "images": image_reports}, ensure_ascii=False, indent=2), encoding="utf-8")
     return CompletionSummary(total_dynamic, total_completed, total_dynamic-total_completed,
-                             completed_images, report_path)
+                             completed_images, total_strong, total_weak, report_path)
