@@ -36,6 +36,13 @@ class ReconstructionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PreprocessingResult:
+    workspace: Path
+    static_images: Path
+    masks: Path
+
+
+@dataclass(frozen=True, slots=True)
 class _Stage:
     title: str
     command: str
@@ -102,6 +109,7 @@ def build_colmap_stages(
     quality: str,
     dynamic_suppression: bool = False,
     low_light_enhancement: bool = False,
+    preprocess_only: bool = False,
 ) -> list[_Stage]:
     max_features, max_image_size = _quality_parameters(quality)
     database = workspace / "database.db"
@@ -247,7 +255,8 @@ def build_colmap_stages(
             ("poisson_mesher", "--input_path", str(fused), "--output_path", str(mesh)),
         ),
     ]
-    return enhancement_stages + preview_stages + formal_stages
+    preprocessing_stages = enhancement_stages + preview_stages
+    return preprocessing_stages if preprocess_only else preprocessing_stages + formal_stages
 
 
 class ColmapRunner(QObject):
@@ -261,6 +270,7 @@ class ColmapRunner(QObject):
     review_requested = Signal(str, str, str)
     enhancement_review_requested = Signal(str, str)
     final_review_requested = Signal(str, str)
+    preprocessing_completed = Signal(object)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -277,6 +287,7 @@ class ColmapRunner(QObject):
         self._dynamic_strength = "conservative"
         self._cancelled = False
         self._active = False
+        self._preprocess_only = False
 
     @property
     def is_running(self) -> bool:
@@ -291,6 +302,7 @@ class ColmapRunner(QObject):
         dynamic_suppression: bool = False,
         dynamic_strength: str = "conservative",
         low_light_enhancement: bool = False,
+        preprocess_only: bool = False,
     ) -> Path:
         if self.is_running:
             raise RuntimeError("已有重建任务正在运行。")
@@ -305,6 +317,8 @@ class ColmapRunner(QObject):
         )
         if image_count < 2:
             raise ValueError("照片目录中至少需要两张受支持的图片。")
+        if preprocess_only and not dynamic_suppression:
+            raise ValueError("照片预处理需要开启动态区域检测。")
 
         workspace = create_run_workspace(project_directory)
         self._workspace = workspace
@@ -320,10 +334,12 @@ class ColmapRunner(QObject):
             quality,
             dynamic_suppression,
             low_light_enhancement,
+            preprocess_only,
         )
         self._stage_index = -1
         self._cancelled = False
         self._active = True
+        self._preprocess_only = preprocess_only
         self.log_received.emit(
             f"COLMAP：{executable}\n照片：{image_directory}\n"
             f"照片数量：{image_count}\n本次工作区：{workspace}\n"
@@ -334,6 +350,7 @@ class ColmapRunner(QObject):
                 else ""
             )
             + f"夜间统一增强：{'开启' if low_light_enhancement else '关闭'}\n"
+            + f"任务类型：{'仅生成最终静态图片数据集' if preprocess_only else '完整三维重建'}\n"
         )
         self.running_changed.emit(True)
         self._start_next_stage()
@@ -623,6 +640,20 @@ class ColmapRunner(QObject):
 
     def _finish_successfully(self) -> None:
         assert self._workspace is not None
+        if self._preprocess_only:
+            static_images = self._workspace / "static_images"
+            masks = self._workspace / "dynamic_masks"
+            if not static_images.is_dir() or not any(static_images.rglob("*")):
+                self._active = False
+                self.running_changed.emit(False)
+                self.failed.emit("照片预处理已结束，但没有生成最终静态图片数据集。")
+                return
+            self._active = False
+            self.running_changed.emit(False)
+            self.preprocessing_completed.emit(
+                PreprocessingResult(self._workspace, static_images, masks)
+            )
+            return
         point_cloud = self._workspace / "dense" / "fused.ply"
         mesh = self._workspace / "dense" / "meshed-poisson.ply"
         if not point_cloud.is_file() or not mesh.is_file():

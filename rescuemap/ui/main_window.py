@@ -50,6 +50,7 @@ from rescuemap.core.candidate_validation import (
 )
 from rescuemap.core.colmap_runner import (
     ColmapRunner,
+    PreprocessingResult,
     ReconstructionResult,
     bundled_colmap_path,
 )
@@ -127,6 +128,7 @@ class MainWindow(QMainWindow):
         self.route_result: RouteResult | None = None
         self.context_mesh: SceneModel | None = None
         self.settings = QSettings("RescueMap", "RescueMap")
+        self.active_pipeline: str | None = None
         self.colmap_runner = ColmapRunner(self)
         self.colmap_runner.log_received.connect(self._append_reconstruction_log)
         self.colmap_runner.stage_changed.connect(self._update_reconstruction_stage)
@@ -139,6 +141,9 @@ class MainWindow(QMainWindow):
         )
         self.colmap_runner.final_review_requested.connect(
             self._review_final_static_dataset
+        )
+        self.colmap_runner.preprocessing_completed.connect(
+            self._preprocessing_completed
         )
 
         self.plotter = QtInteractor(self)
@@ -181,7 +186,10 @@ class MainWindow(QMainWindow):
             "background:white; border:1px solid #b78d00; padding:5px; }"
         )
         self.picking_help_widget.hide()
-        side_layout.addWidget(self._build_reconstruction_group())
+        reconstruction_group = self._build_reconstruction_group()
+        preprocessing_group = self._build_preprocessing_group()
+        side_layout.addWidget(preprocessing_group)
+        side_layout.addWidget(reconstruction_group)
         side_layout.addWidget(info_group)
         side_layout.addWidget(self._build_full_map_group())
         side_layout.addWidget(self._build_calibration_group())
@@ -239,38 +247,6 @@ class MainWindow(QMainWindow):
         self.reconstruction_quality_combo.addItem("高质量重建", "high")
         self.reconstruction_quality_combo.setCurrentIndex(1)
 
-        self.dynamic_suppression_checkbox = QCheckBox(
-            "自动抑制跨帧移动物体（推荐）"
-        )
-        self.dynamic_suppression_checkbox.setChecked(True)
-        self.dynamic_suppression_checkbox.setToolTip(
-            "先进行一次低分辨率快速重建，根据相邻照片的几何不一致区域自动生成掩膜，"
-            "再进行正式重建。会增加一些处理时间。"
-        )
-        self.dynamic_strength_combo = QComboBox()
-        self.dynamic_strength_combo.addItem("保守：优先保留静态地形（推荐）", "conservative")
-        self.dynamic_strength_combo.addItem("标准：动态抑制与保留地形平衡", "standard")
-        self.dynamic_strength_combo.addItem("激进：动态物体较多时使用", "aggressive")
-        self.dynamic_strength_combo.setCurrentIndex(0)
-        self.dynamic_strength_combo.setToolTip(
-            "先将跨帧几何异常作为动态种子，再依据图像边缘扩张为完整区域。"
-            "保守模式的扩张范围较小；激进模式覆盖更宽，但误删风险也更高。"
-        )
-        self.dynamic_strength_combo.setEnabled(
-            self.dynamic_suppression_checkbox.isChecked()
-        )
-        self.dynamic_suppression_checkbox.toggled.connect(
-            self.dynamic_strength_combo.setEnabled
-        )
-        self.low_light_enhancement_checkbox = QCheckBox(
-            "统一增强夜间/弱光照片（保留原图）"
-        )
-        self.low_light_enhancement_checkbox.setChecked(False)
-        self.low_light_enhancement_checkbox.setToolTip(
-            "使用整个数据集共用的亮度映射提高暗部对比度，避免逐张自动增强造成亮度跳变。"
-            "增强图另存到本次工作区，不会覆盖原始照片。"
-        )
-
         buttons = QHBoxLayout()
         self.start_reconstruction_button = QPushButton("开始一键重建")
         self.start_reconstruction_button.clicked.connect(self.start_reconstruction)
@@ -300,19 +276,80 @@ class MainWindow(QMainWindow):
         layout.addWidget(colmap_button)
         layout.addWidget(QLabel("重建质量："))
         layout.addWidget(self.reconstruction_quality_combo)
-        layout.addWidget(self.dynamic_suppression_checkbox)
-        layout.addWidget(QLabel("动态抑制强度："))
-        layout.addWidget(self.dynamic_strength_combo)
-        layout.addWidget(self.low_light_enhancement_checkbox)
         layout.addLayout(buttons)
         layout.addWidget(self.reconstruction_progress)
         layout.addWidget(self.reconstruction_log)
+        return group
+
+    def _build_preprocessing_group(self) -> QGroupBox:
+        group = CollapsibleGroupBox("照片预处理（先处理并确认，再进行重建）")
+        layout = QVBoxLayout(group)
+        explanation = QLabel(
+            "独立生成最终静态图片数据集：弱光增强 → 自动动态检测 → "
+            "人工增删框 → 多视角背景恢复 → 最终确认。"
+        )
+        explanation.setWordWrap(True)
+        self.preprocess_image_directory_edit = QLineEdit()
+        self.preprocess_image_directory_edit.setPlaceholderText("包含原始照片的文件夹")
+        image_button = QPushButton("选择原始照片文件夹")
+        image_button.clicked.connect(self.choose_preprocess_images)
+        self.preprocess_project_directory_edit = QLineEdit()
+        self.preprocess_project_directory_edit.setPlaceholderText("预处理成果与中间文件保存目录")
+        project_button = QPushButton("选择预处理保存目录")
+        project_button.clicked.connect(self.choose_preprocess_project)
+        self.low_light_enhancement_checkbox = QCheckBox(
+            "统一增强夜间/弱光照片（处理后先预览）"
+        )
+        self.low_light_enhancement_checkbox.setChecked(True)
+        self.dynamic_strength_combo = QComboBox()
+        self.dynamic_strength_combo.addItem("保守：优先保留静态内容", "conservative")
+        self.dynamic_strength_combo.addItem("标准：动态抑制与保留内容平衡（推荐）", "standard")
+        self.dynamic_strength_combo.addItem("激进：动态物体非常多时使用", "aggressive")
+        self.dynamic_strength_combo.setCurrentIndex(1)
+        buttons = QHBoxLayout()
+        self.start_preprocessing_button = QPushButton("开始照片预处理")
+        self.start_preprocessing_button.clicked.connect(self.start_preprocessing)
+        self.cancel_preprocessing_button = QPushButton("取消")
+        self.cancel_preprocessing_button.clicked.connect(self.colmap_runner.cancel)
+        self.cancel_preprocessing_button.setEnabled(False)
+        buttons.addWidget(self.start_preprocessing_button)
+        buttons.addWidget(self.cancel_preprocessing_button)
+        self.preprocessing_progress = QProgressBar()
+        self.preprocessing_progress.setRange(0, 1)
+        self.preprocessing_progress.setValue(0)
+        self.preprocessing_progress.setFormat("尚未开始")
+        self.preprocessing_log = QPlainTextEdit()
+        self.preprocessing_log.setReadOnly(True)
+        self.preprocessing_log.setMaximumHeight(140)
+        layout.addWidget(explanation)
+        layout.addWidget(QLabel("原始照片目录："))
+        layout.addWidget(self.preprocess_image_directory_edit)
+        layout.addWidget(image_button)
+        layout.addWidget(QLabel("预处理保存目录："))
+        layout.addWidget(self.preprocess_project_directory_edit)
+        layout.addWidget(project_button)
+        layout.addWidget(self.low_light_enhancement_checkbox)
+        layout.addWidget(QLabel("自动动态检测强度："))
+        layout.addWidget(self.dynamic_strength_combo)
+        layout.addLayout(buttons)
+        layout.addWidget(self.preprocessing_progress)
+        layout.addWidget(self.preprocessing_log)
         return group
 
     def choose_reconstruction_images(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "选择照片文件夹")
         if directory:
             self.image_directory_edit.setText(directory)
+
+    def choose_preprocess_images(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "选择原始照片文件夹")
+        if directory:
+            self.preprocess_image_directory_edit.setText(directory)
+
+    def choose_preprocess_project(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "选择预处理保存目录")
+        if directory:
+            self.preprocess_project_directory_edit.setText(directory)
 
     def choose_reconstruction_project(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "选择工程保存目录")
@@ -332,47 +369,103 @@ class MainWindow(QMainWindow):
 
     def start_reconstruction(self) -> None:
         self.reconstruction_log.clear()
+        self.active_pipeline = "reconstruction"
         try:
             workspace = self.colmap_runner.start(
                 Path(self.colmap_path_edit.text().strip()),
                 Path(self.image_directory_edit.text().strip()),
                 Path(self.project_directory_edit.text().strip()),
                 str(self.reconstruction_quality_combo.currentData()),
-                self.dynamic_suppression_checkbox.isChecked(),
-                str(self.dynamic_strength_combo.currentData()),
-                self.low_light_enhancement_checkbox.isChecked(),
+                False,
+                "conservative",
+                False,
+                False,
             )
             self.settings.setValue("colmap_path", self.colmap_path_edit.text().strip())
             self.statusBar().showMessage(f"正在重建：{workspace}")
         except Exception as exc:
+            self.active_pipeline = None
             QMessageBox.warning(self, "无法开始重建", str(exc))
 
+    def start_preprocessing(self) -> None:
+        self.preprocessing_log.clear()
+        self.active_pipeline = "preprocessing"
+        try:
+            workspace = self.colmap_runner.start(
+                Path(self.colmap_path_edit.text().strip()),
+                Path(self.preprocess_image_directory_edit.text().strip()),
+                Path(self.preprocess_project_directory_edit.text().strip()),
+                "fast",
+                True,
+                str(self.dynamic_strength_combo.currentData()),
+                self.low_light_enhancement_checkbox.isChecked(),
+                True,
+            )
+            self.statusBar().showMessage(f"正在预处理照片：{workspace}")
+        except Exception as exc:
+            self.active_pipeline = None
+            QMessageBox.warning(self, "无法开始照片预处理", str(exc))
+
     def _append_reconstruction_log(self, text: str) -> None:
-        cursor = self.reconstruction_log.textCursor()
+        target = (
+            self.preprocessing_log
+            if self.active_pipeline == "preprocessing"
+            else self.reconstruction_log
+        )
+        cursor = target.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         cursor.insertText(text)
-        self.reconstruction_log.setTextCursor(cursor)
-        self.reconstruction_log.ensureCursorVisible()
+        target.setTextCursor(cursor)
+        target.ensureCursorVisible()
 
     def _update_reconstruction_stage(self, current: int, total: int, title: str) -> None:
-        self.reconstruction_progress.setRange(0, total)
-        self.reconstruction_progress.setValue(current - 1)
-        self.reconstruction_progress.setFormat(f"第 {current}/{total} 步：{title}")
-        self.statusBar().showMessage(f"COLMAP：{title}")
+        progress = (
+            self.preprocessing_progress
+            if self.active_pipeline == "preprocessing"
+            else self.reconstruction_progress
+        )
+        progress.setRange(0, total)
+        progress.setValue(current - 1)
+        progress.setFormat(f"第 {current}/{total} 步：{title}")
+        self.statusBar().showMessage(f"{'照片预处理' if self.active_pipeline == 'preprocessing' else 'COLMAP'}：{title}")
 
     def _set_reconstruction_running(self, running: bool) -> None:
         self.start_reconstruction_button.setEnabled(not running)
-        self.cancel_reconstruction_button.setEnabled(running)
-        self.dynamic_suppression_checkbox.setEnabled(not running)
-        self.low_light_enhancement_checkbox.setEnabled(not running)
-        self.dynamic_strength_combo.setEnabled(
-            not running and self.dynamic_suppression_checkbox.isChecked()
+        self.start_preprocessing_button.setEnabled(not running)
+        self.cancel_reconstruction_button.setEnabled(
+            running and self.active_pipeline == "reconstruction"
         )
+        self.cancel_preprocessing_button.setEnabled(
+            running and self.active_pipeline == "preprocessing"
+        )
+        self.low_light_enhancement_checkbox.setEnabled(not running)
+        self.dynamic_strength_combo.setEnabled(not running)
 
     def _reconstruction_failed(self, message: str) -> None:
-        self.reconstruction_progress.setFormat("重建未完成")
+        progress = (
+            self.preprocessing_progress
+            if self.active_pipeline == "preprocessing"
+            else self.reconstruction_progress
+        )
+        progress.setFormat("照片预处理未完成" if self.active_pipeline == "preprocessing" else "重建未完成")
         self.statusBar().showMessage(message)
         QMessageBox.warning(self, "重建未完成", message)
+        self.active_pipeline = None
+
+    def _preprocessing_completed(self, result: PreprocessingResult) -> None:
+        self.preprocessing_progress.setValue(self.preprocessing_progress.maximum())
+        self.preprocessing_progress.setFormat("照片预处理完成，已送入一键重建")
+        self.image_directory_edit.setText(str(result.static_images))
+        self.project_directory_edit.setText(str(result.workspace.parent))
+        self.statusBar().showMessage(f"照片预处理完成：{result.static_images}")
+        self.active_pipeline = None
+        QMessageBox.information(
+            self,
+            "照片预处理完成",
+            "最终静态图片数据集已经生成，并自动填入下方的“照片一键重建”。\n\n"
+            "请确认照片目录后，再点击“开始一键重建”。\n\n"
+            f"最终图片：{result.static_images}",
+        )
 
     def _review_dynamic_dataset(
         self, phase: str, image_directory: str, mask_directory: str
@@ -425,17 +518,11 @@ class MainWindow(QMainWindow):
         self.show_full_map_checkbox.setChecked(True)
         self.reconstruction_progress.setFormat("重建与地图加载完成")
         self.statusBar().showMessage(f"重建完成：{result.workspace}")
-        dynamic_message = (
-                "已执行精细跨帧几何动态干扰抑制；掩膜、红色叠加预览和逐图统计"
-                "保存在本次工作区。\n\n"
-            if self.dynamic_suppression_checkbox.isChecked()
-            else ""
-        )
+        self.active_pipeline = None
         QMessageBox.information(
             self,
             "重建完成",
             "稠密点云和 Poisson 网格已经生成并自动加载。\n\n"
-            f"{dynamic_message}"
             f"工作区：{result.workspace}",
         )
 

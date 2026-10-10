@@ -259,6 +259,21 @@ class CandidateValidationTests(unittest.TestCase):
             self.assertEqual(stages[1].kind, "review_enhancement")
             self.assertIn(str(workspace / "enhanced_images"), stages[2].arguments)
 
+    def test_preprocessing_pipeline_stops_before_formal_reconstruction(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
+            root = Path(temporary_directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            stages = build_colmap_stages(
+                root / "colmap.exe", root / "images", workspace,
+                "fast", True, True, True,
+            )
+            kinds = [stage.kind for stage in stages]
+            self.assertIn("review_final_static", kinds)
+            self.assertNotIn("mapper_final", kinds)
+            self.assertFalse(any(stage.arguments and stage.arguments[0] == "patch_match_stereo"
+                                 for stage in stages))
+
 
 class CalibrationTests(unittest.TestCase):
     def test_selected_plane_maps_to_zero_height(self):
