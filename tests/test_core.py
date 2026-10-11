@@ -19,6 +19,7 @@ from rescuemap.core.background_completion import (
     _normalised_correlation,
     _project_homography,
     _robust_homography,
+    _restore_texture_after_feather,
     _texture_adaptive_boundary_fill,
 )
 from rescuemap.core.colmap_runner import ColmapRunner, build_colmap_stages
@@ -152,6 +153,31 @@ class DynamicSuppressionTests(unittest.TestCase):
 
         self.assertFalse(strong)
         self.assertGreater(float(values.std()), 0.2)
+
+    def test_post_feather_stage_recovers_outer_directional_texture(self):
+        height, width = 90, 130
+        yy, xx = np.indices((height, width))
+        texture = 112 + 28 * np.sin((xx + 0.35 * yy) / 3.2)
+        rgb = np.repeat(np.clip(texture, 0, 255)[:, :, None], 3, axis=2).astype(np.uint8)
+        region = np.zeros((height, width), dtype=bool)
+        region[28:64, 43:89] = True
+        rgb[region] = np.array([112, 112, 112], dtype=np.uint8)
+
+        restored, applied = _restore_texture_after_feather(rgb, region)
+
+        self.assertTrue(applied)
+        self.assertGreater(float(restored.std()), 1.0)
+        self.assertAlmostEqual(float(restored.mean()), 112.0, delta=4.0)
+
+    def test_post_feather_stage_does_not_invent_texture_on_flat_background(self):
+        rgb = np.full((70, 100, 3), [104, 96, 88], dtype=np.uint8)
+        region = np.zeros((70, 100), dtype=bool)
+        region[22:50, 32:68] = True
+
+        restored, applied = _restore_texture_after_feather(rgb, region)
+
+        self.assertFalse(applied)
+        np.testing.assert_array_equal(restored, rgb[region])
 
     def test_directional_boundary_fill_uses_surrounding_texture(self):
         height, width = 50, 70

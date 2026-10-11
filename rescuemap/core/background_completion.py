@@ -393,6 +393,79 @@ def _texture_adaptive_boundary_fill(
     return np.clip(work[ly, lx], 0, 255).astype(np.uint8), strong_texture
 
 
+def _restore_texture_after_feather(
+    rgb: np.ndarray, region: np.ndarray
+) -> tuple[np.ndarray, bool]:
+    """Re-inject reliable outer texture after Gaussian seam feathering.
+
+    Feathering is deliberately a low-pass operation: it removes a rectangular
+    seam, but repeated refinement can also erase road markings and surface
+    texture.  This stage keeps the completed low-frequency colour field and
+    transports only the zero-mean high-frequency residual from a farther,
+    strongly textured outer ring.  Therefore an object colour or silhouette is
+    not copied back wholesale into the repaired region.
+    """
+    rgb_float = np.asarray(rgb, dtype=float)
+    region = np.asarray(region, dtype=bool)
+    ys, xs = np.where(region)
+    if not len(xs):
+        return np.empty((0, 3), dtype=np.uint8), False
+
+    margin = max(24, min(96, int(np.sqrt(len(xs))) // 2 + 18))
+    y0, y1 = max(0, ys.min() - margin), min(region.shape[0], ys.max() + margin + 1)
+    x0, x1 = max(0, xs.min() - margin), min(region.shape[1], xs.max() + margin + 1)
+    local_region = region[y0:y1, x0:x1]
+    local_rgb = rgb_float[y0:y1, x0:x1]
+
+    inner_guard = binary_dilation(local_region, iterations=min(5, margin))
+    outer_limit = binary_dilation(local_region, iterations=min(22, margin))
+    outer_ring = outer_limit & ~inner_guard
+    if int(outer_ring.sum()) < 24:
+        return np.clip(local_rgb[local_region], 0, 255).astype(np.uint8), False
+
+    gray = local_rgb @ np.array([0.299, 0.587, 0.114])
+    gy, gx = np.gradient(gray)
+    gradient = np.hypot(gx, gy)
+    outer_strength = float(np.percentile(gradient[outer_ring], 72))
+    inner_strength = (
+        float(np.percentile(gradient[local_region], 72))
+        if int(local_region.sum()) >= 8 else 0.0
+    )
+    # Flat surroundings cannot provide meaningful texture.  If the repaired
+    # area is already at least as sharp as its surroundings, adding residuals
+    # would merely amplify noise.
+    if outer_strength < 7.0 or inner_strength >= outer_strength * 0.92:
+        return np.clip(local_rgb[local_region], 0, 255).astype(np.uint8), False
+
+    source_threshold = max(6.0, float(np.percentile(gradient[outer_ring], 62)))
+    strong_sources = outer_ring & (gradient >= source_threshold)
+    if int(strong_sources.sum()) < 16:
+        return np.clip(local_rgb[local_region], 0, 255).astype(np.uint8), False
+
+    low_frequency = gaussian_filter(local_rgb, sigma=(2.2, 2.2, 0.0), mode="nearest")
+    residual = local_rgb - low_frequency
+    # Extend the closest reliable strong-texture residual through the context
+    # band first.  The existing directional boundary transport then combines
+    # opposing directions instead of copying one raw RGB column across a box.
+    _, nearest_strong = distance_transform_edt(~strong_sources, return_indices=True)
+    reliable_residual = residual[nearest_strong[0], nearest_strong[1]]
+    shifted = np.clip(reliable_residual + 128.0, 0, 255).astype(np.uint8)
+    transported = (
+        _directional_boundary_fill(shifted, local_region).astype(float) - 128.0
+    )
+    # Remove any DC component: colour and illumination must still come from
+    # the completed image, while only texture is restored here.
+    transported -= np.median(transported, axis=0, keepdims=True)
+    transported = np.clip(transported, -32.0, 32.0)
+
+    deficit = float(
+        np.clip((outer_strength - inner_strength) / max(outer_strength, 1e-9), 0.0, 1.0)
+    )
+    gain = float(np.clip(0.26 + 0.40 * deficit, 0.28, 0.62))
+    values = local_rgb[local_region] + gain * transported
+    return np.clip(values, 0, 255).astype(np.uint8), True
+
+
 def _near_side_ground_fill(rgb: np.ndarray, hole: np.ndarray) -> np.ndarray:
     """Fill from the lower/near-side boundary for forward-looking images."""
     rgb = np.asarray(rgb, dtype=float)
@@ -509,6 +582,19 @@ def complete_dynamic_backgrounds(
                 result[seam] = np.clip(
                     0.62 * result[seam] + 0.38 * smoothed[seam], 0, 255
                 ).astype(np.uint8)
+
+            # Every completion pass is followed by one restoration pass.
+            # Gaussian feathering removes the seam; the second stage restores
+            # directional detail only where the selected area is measurably
+            # blurrier than reliable strong texture farther outside it.
+            for component_id in range(1, component_count + 1):
+                component = labels == component_id
+                restored, texture_recovered = _restore_texture_after_feather(
+                    result, component
+                )
+                if texture_recovered:
+                    result[component] = restored
+                    completed_local_texture[component] = True
 
         if mode == "multiview":
             # First pass intentionally retains the earlier conservative
@@ -672,8 +758,9 @@ def complete_dynamic_backgrounds(
         ),
         "refinement_policy": {
             "strong_texture": "harmonic_colour_field_plus_directional_high_frequency_residual",
-            "weak_texture": "full_boundary_diffusion_plus_dominant_quantised_colour",
-            "seam": "inner_three_pixel_gaussian_feather",
+            "weak_texture": "dominant_colour_then_coherent_outer_texture_residual",
+            "seam": "three_pixel_two_sided_gaussian_feather",
+            "post_feather": "outer_strong_texture_directional_residual_recovery",
         } if mode == "refine" else None,
         "summary": {"dynamic_pixels": total_dynamic, "completed_pixels": total_completed,
                     "strong_texture_completed_pixels": total_strong,
