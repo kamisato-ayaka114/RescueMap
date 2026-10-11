@@ -652,7 +652,11 @@ class MainWindow(QMainWindow):
             Path(original_directory), Path(static_directory),
             title="确认最终静态图片数据集",
             confirm_text="确认并保存静态数据集",
-            alternative_text="返回继续修正动态框",
+            alternative_text="返回继续框选补全/平滑区域",
+            message_text=(
+                "逐张比较原图和当前静态数据集。若仍有黑洞、错误纹理或明显接缝，"
+                "请返回继续框选；已有选区会保留，可反复修复，直到你确认进入下一步。"
+            ),
             parent=self,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:

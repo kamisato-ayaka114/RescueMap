@@ -312,13 +312,19 @@ def _texture_adaptive_boundary_fill(
     x0, x1 = max(0, xs.min() - margin), min(hole.shape[1], xs.max() + margin + 1)
     local_hole = hole[y0:y1, x0:x1]
     local_rgb = rgb_float[y0:y1, x0:x1]
-    ring = binary_dilation(local_hole, iterations=min(6, margin)) & ~local_hole
+    # References are intentionally sampled farther outside the selected box.
+    # The near seam may already be blurred or black after the first stitching
+    # round, while the 8-12 pixel outer ring usually still contains reliable
+    # background colour and texture direction.
+    ring_width = min(12, margin)
+    ring = binary_dilation(local_hole, iterations=ring_width) & ~local_hole
+    near_ring = binary_dilation(local_hole, iterations=min(4, margin)) & ~local_hole
 
     gray = local_rgb @ np.array([0.299, 0.587, 0.114])
     gy, gx = np.gradient(gray)
     texture_strength = (
-        float(np.percentile(np.hypot(gx[ring], gy[ring]), 65))
-        if ring.any() else 0.0
+        float(np.percentile(np.hypot(gx[near_ring], gy[near_ring]), 65))
+        if near_ring.any() else 0.0
     )
     strong_texture = texture_strength >= 8.0
 
@@ -332,25 +338,56 @@ def _texture_adaptive_boundary_fill(
         smoothed = gaussian_filter(work, sigma=(1.05, 1.05, 0.0), mode="nearest")
         work[local_hole] = smoothed[local_hole]
 
-    if strong_texture:
-        low_frequency = gaussian_filter(local_rgb, sigma=(2.0, 2.0, 0.0), mode="nearest")
-        shifted_residual = np.clip(local_rgb - low_frequency + 128.0, 0, 255)
-        residual_values = (
-            _directional_boundary_fill(shifted_residual.astype(np.uint8), local_hole)
-            .astype(float) - 128.0
+    def extended_residual(expansion: int) -> np.ndarray:
+        reference_hole = binary_dilation(local_hole, iterations=expansion)
+        low_frequency = gaussian_filter(
+            local_rgb, sigma=(2.0, 2.0, 0.0), mode="nearest"
         )
+        shifted = np.clip(local_rgb - low_frequency + 128.0, 0, 255)
+        propagated = _directional_boundary_fill(
+            shifted.astype(np.uint8), reference_hole
+        ).astype(float) - 128.0
+        field = np.zeros_like(local_rgb)
+        field[reference_hole] = propagated
+        return field[local_hole]
+
+    if strong_texture:
+        residual_values = extended_residual(3)
         ly, lx = np.where(local_hole)
         texture_weight = float(np.clip(texture_strength / 42.0, 0.25, 0.72))
         work[ly, lx] += texture_weight * residual_values
     elif ring.any():
         # "Most common surrounding pixel" is estimated in 16-level colour
         # bins so sensor noise does not make every RGB triplet unique.
-        samples = local_rgb[ring]
+        samples = local_rgb[near_ring if near_ring.any() else ring]
         quantised = np.clip(samples // 16, 0, 15).astype(np.int16)
         codes = quantised[:, 0] * 256 + quantised[:, 1] * 16 + quantised[:, 2]
         dominant = int(np.bincount(codes, minlength=4096).argmax())
         dominant_colour = samples[codes == dominant].mean(axis=0)
         work[local_hole] = 0.78 * work[local_hole] + 0.22 * dominant_colour
+
+        # After the weak area has received its stable colour field, borrow a
+        # low-amplitude, directionally coherent residual from farther outside.
+        # This supplies COLMAP with real neighbouring texture without turning
+        # lamp noise or a single edge into a fabricated high-contrast stripe.
+        outer = (
+            binary_dilation(local_hole, iterations=min(16, margin))
+            & ~binary_dilation(local_hole, iterations=min(4, margin))
+        )
+        if outer.any():
+            outer_gradient = np.hypot(gx[outer], gy[outer])
+            outer_strength = float(np.percentile(outer_gradient, 70))
+            structure = np.array([
+                [np.mean(gx[outer] ** 2), np.mean(gx[outer] * gy[outer])],
+                [np.mean(gx[outer] * gy[outer]), np.mean(gy[outer] ** 2)],
+            ])
+            eigenvalues = np.linalg.eigvalsh(structure)
+            coherence = float(
+                (eigenvalues[-1] - eigenvalues[0])
+                / max(eigenvalues[-1] + eigenvalues[0], 1e-9)
+            )
+            if outer_strength >= 7.0 and coherence >= 0.28:
+                work[local_hole] += 0.18 * extended_residual(5)
 
     ly, lx = np.where(local_hole)
     return np.clip(work[ly, lx], 0, 255).astype(np.uint8), strong_texture
@@ -459,10 +496,14 @@ def complete_dynamic_backgrounds(
                 else:
                     completed_small_hole[ys, xs] = True
 
-            # Gaussian filtering is deliberately restricted to the inner seam
-            # of regions selected by the user.  It blends the join but never
-            # turns the whole object into a uniform patch.
-            seam = completed & ~binary_erosion(completed, iterations=3)
+            # Feather three pixels to both sides of the chosen boundary.  The
+            # slight outward expansion removes a visible box edge and samples
+            # reliable static background just outside the manual selection,
+            # while the region interior keeps its reconstructed texture.
+            seam = (
+                binary_dilation(completed, iterations=3)
+                & ~binary_erosion(completed, iterations=3)
+            )
             if seam.any():
                 smoothed = gaussian_filter(result.astype(float), sigma=(1.0, 1.0, 0.0))
                 result[seam] = np.clip(

@@ -1,4 +1,5 @@
 import unittest
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import struct
@@ -52,6 +53,45 @@ from rescuemap.core.terrain_mesh import build_terrain_mesh
 
 
 class DynamicSuppressionTests(unittest.TestCase):
+    def test_saved_annotation_boxes_restore_an_older_workspace(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
+            workspace = Path(temporary_directory)
+            images = workspace / "images"
+            masks = workspace / "masks"
+            images.mkdir()
+            Image.fromarray(np.full((20, 30, 3), 100, dtype=np.uint8)).save(
+                images / "frame.jpg"
+            )
+            annotations = workspace / "review_initial_annotations.json"
+            annotations.write_text(json.dumps({
+                "images": [{"image": "frame.jpg", "boxes": [[4, 5, 12, 15]]}]
+            }), encoding="utf-8")
+
+            ColmapRunner._restore_annotation_boxes(images, annotations, masks)
+
+            restored = np.asarray(Image.open(masks / "frame.jpg.png"))
+            self.assertTrue(np.all(restored[5:16, 4:13] == 0))
+            self.assertEqual(int(np.count_nonzero(restored == 0)), 11 * 9)
+
+    def test_unresolved_dynamic_pixels_are_carried_into_second_review(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
+            workspace = Path(temporary_directory)
+            images = workspace / "static_images"
+            masks = workspace / "refinement_masks"
+            dynamic_masks = workspace / "dynamic_masks"
+            images.mkdir()
+            dynamic_masks.mkdir()
+            rgb = np.full((24, 32, 3), 120, dtype=np.uint8)
+            unresolved = np.full((24, 32), 255, dtype=np.uint8)
+            unresolved[7:18, 9:24] = 0
+            Image.fromarray(rgb).save(images / "frame.jpg")
+            Image.fromarray(unresolved).save(dynamic_masks / "frame.jpg.png")
+
+            ColmapRunner._prepare_refinement_masks(images, masks)
+
+            carried = np.asarray(Image.open(masks / "frame.jpg.png"))
+            np.testing.assert_array_equal(carried, unresolved)
+
     def test_human_refinement_unmasks_repaired_pixels_for_colmap(self):
         with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
             workspace = Path(temporary_directory)
@@ -97,6 +137,21 @@ class DynamicSuppressionTests(unittest.TestCase):
 
         self.assertFalse(strong)
         np.testing.assert_allclose(values.mean(axis=0), [108, 92, 76], atol=3.0)
+
+    def test_weak_boundary_can_borrow_low_amplitude_outer_texture(self):
+        height, width = 90, 120
+        rgb = np.full((height, width, 3), [112, 96, 80], dtype=np.uint8)
+        hole = np.zeros((height, width), dtype=bool)
+        hole[30:60, 42:78] = True
+        # Keep the immediate boundary weak, but provide coherent texture a
+        # little farther away on both sides of the selected region.
+        for x in list(range(25, 38)) + list(range(82, 95)):
+            rgb[:, x] = np.array([80 + (x % 4) * 18] * 3, dtype=np.uint8)
+
+        values, strong = _texture_adaptive_boundary_fill(rgb, hole)
+
+        self.assertFalse(strong)
+        self.assertGreater(float(values.std()), 0.2)
 
     def test_directional_boundary_fill_uses_surrounding_texture(self):
         height, width = 50, 70

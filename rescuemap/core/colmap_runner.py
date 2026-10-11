@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from pathlib import Path
+import shutil
 import sys
 
 import numpy as np
@@ -428,6 +430,33 @@ class ColmapRunner(QObject):
                 and not (workspace / "dynamic_preview" / "database.db").is_file():
             raise FileNotFoundError("该工程缺少快速重建数据库，无法继续自动处理。")
 
+        # The working dynamic mask is reduced as pixels are successfully
+        # stitched.  Restore the immutable, human-reviewed snapshot when the
+        # user explicitly goes back to the first review or stitching stage.
+        reviewed_masks = workspace / "reviewed_dynamic_masks"
+        if start_kind in {"review_initial", "complete_backgrounds"}:
+            if reviewed_masks.is_dir():
+                shutil.copytree(
+                    reviewed_masks, workspace / "dynamic_masks", dirs_exist_ok=True
+                )
+            elif (workspace / "review_initial_annotations.json").is_file():
+                self._restore_annotation_boxes(
+                    processing_directory,
+                    workspace / "review_initial_annotations.json",
+                    workspace / "dynamic_masks",
+                )
+                shutil.copytree(
+                    workspace / "dynamic_masks", reviewed_masks, dirs_exist_ok=True
+                )
+        if start_kind in {"review_completed", "complete_final"} \
+                and not (workspace / "refinement_masks").is_dir() \
+                and (workspace / "review_completed_annotations.json").is_file():
+            self._restore_annotation_boxes(
+                workspace / "static_images",
+                workspace / "review_completed_annotations.json",
+                workspace / "refinement_masks",
+            )
+
         self._workspace = workspace
         self._image_directory = image_directory
         self._processing_image_directory = processing_directory
@@ -438,7 +467,8 @@ class ColmapRunner(QObject):
         self._active = True
         self._preprocess_only = True
         self._resume_from_static = (
-            start_kind != "generate_masks" and (workspace / "static_images").is_dir()
+            start_kind in {"review_completed", "complete_final", "review_final_static"}
+            and (workspace / "static_images").is_dir()
         )
         self.log_received.emit(
             f"继续已有照片预处理工程：{workspace}\n"
@@ -471,6 +501,18 @@ class ColmapRunner(QObject):
         if not accepted:
             self.cancel()
             return
+        if (
+            self._workspace is not None
+            and 0 <= self._stage_index < len(self._stages)
+            and self._stages[self._stage_index].kind == "review_initial"
+        ):
+            source = self._workspace / "dynamic_masks"
+            target = self._workspace / "reviewed_dynamic_masks"
+            if source.is_dir():
+                shutil.copytree(source, target, dirs_exist_ok=True)
+                self.log_received.emit(
+                    "第一轮人工动态框已独立保存；后续拼接不会删除这份标注。\n"
+                )
         self.log_received.emit("人工复核结果已保存，继续处理。\n")
         QTimer.singleShot(0, self._start_next_stage)
 
@@ -502,6 +544,8 @@ class ColmapRunner(QObject):
             self._stage_index = review_index - 1
             self.log_received.emit("返回第二次动态框复核，可继续修正后重新生成最终数据集。\n")
         else:
+            assert self._workspace is not None
+            self._accept_refined_pixels(self._workspace)
             self.log_received.emit(
                 "最终静态图片数据集已确认，保存并返回主界面。\n"
                 if self._preprocess_only
@@ -731,21 +775,71 @@ class ColmapRunner(QObject):
         )
 
     @staticmethod
+    def _restore_annotation_boxes(
+        image_directory: Path, annotation_path: Path, mask_directory: Path
+    ) -> None:
+        """Recreate editable masks from saved box JSON in an older project."""
+        try:
+            payload = json.loads(annotation_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return
+        mask_directory.mkdir(parents=True, exist_ok=True)
+        for record in payload.get("images", []):
+            relative = Path(str(record.get("image", "")))
+            image_path = image_directory / relative
+            if not image_path.is_file():
+                continue
+            with Image.open(image_path) as opened:
+                static_mask = np.full(
+                    (opened.height, opened.width), 255, dtype=np.uint8
+                )
+            for box in record.get("boxes", []):
+                if not isinstance(box, list) or len(box) != 4:
+                    continue
+                x0, y0, x1, y1 = (int(value) for value in box)
+                x0 = max(0, min(static_mask.shape[1] - 1, x0))
+                x1 = max(0, min(static_mask.shape[1] - 1, x1))
+                y0 = max(0, min(static_mask.shape[0] - 1, y0))
+                y1 = max(0, min(static_mask.shape[0] - 1, y1))
+                if x1 >= x0 and y1 >= y0:
+                    static_mask[y0:y1 + 1, x0:x1 + 1] = 0
+            target = mask_directory / (str(relative) + ".png")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(static_mask).save(target)
+
+    @staticmethod
     def _prepare_refinement_masks(
         image_directory: Path, mask_directory: Path
     ) -> None:
-        """Create persistent empty masks for user-selected seam refinement."""
+        """Carry unresolved first-review boxes into persistent refinement masks."""
         mask_directory.mkdir(parents=True, exist_ok=True)
+        unresolved_root = mask_directory.parent / "dynamic_masks"
         for image_path in image_directory.rglob("*"):
             if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_SUFFIXES:
                 continue
             relative = image_path.relative_to(image_directory)
             target = mask_directory / (str(relative) + ".png")
-            if target.is_file():
-                continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            with Image.open(image_path) as opened:
-                Image.new("L", opened.size, 255).save(target)
+            unresolved_path = unresolved_root / (str(relative) + ".png")
+            if target.is_file():
+                with Image.open(target) as opened:
+                    refinement_static = np.asarray(opened.convert("L")).copy()
+            else:
+                with Image.open(image_path) as opened:
+                    refinement_static = np.full(
+                        (opened.height, opened.width), 255, dtype=np.uint8
+                    )
+            if unresolved_path.is_file():
+                with Image.open(unresolved_path) as opened:
+                    unresolved_static = np.asarray(opened.convert("L"))
+                if unresolved_static.shape == refinement_static.shape:
+                    # Black in either mask means the region must remain boxed.
+                    # Pixels successfully stitched are white in the unresolved
+                    # mask and therefore disappear unless manually retained.
+                    refinement_static = np.minimum(
+                        refinement_static, unresolved_static
+                    )
+            Image.fromarray(refinement_static.astype(np.uint8)).save(target)
 
     @staticmethod
     def _accept_refined_pixels(workspace: Path) -> None:
@@ -779,34 +873,74 @@ class ColmapRunner(QObject):
         # originals would silently put the removed moving objects back.
         source_directory = (
             self._workspace / "static_images"
-            if final or self._resume_from_static
-            else self._processing_image_directory
+            if final else self._processing_image_directory
         )
         mask_directory = self._workspace / (
             "refinement_masks" if final else "dynamic_masks"
         )
         if final:
             self._prepare_refinement_masks(source_directory, mask_directory)
-        completion = complete_dynamic_backgrounds(
-            self._workspace / "dynamic_preview" / "database.db",
-            source_directory,
-            mask_directory,
-            self._workspace / "static_images",
-            preview_directory=self._workspace / (
-                "final_background_previews" if final else "background_completion_previews"
-            ),
-            report_path=self._workspace / (
-                "final_background_report.json" if final else "background_completion_report.json"
-            ),
-            mode="refine" if final else "multiview",
-            progress_callback=lambda current, total: self.photo_progress.emit(
-                current, total,
-                "人工选区纹理补全与边界平滑" if final else "跨帧拼接静态背景",
-            ),
-            should_cancel=lambda: self._cancelled,
+        database = self._workspace / "dynamic_preview" / "database.db"
+        preview_directory = self._workspace / (
+            "final_background_previews" if final else "background_completion_previews"
         )
-        if final and not self._cancelled:
-            self._accept_refined_pixels(self._workspace)
+        if final:
+            completion = complete_dynamic_backgrounds(
+                database,
+                source_directory,
+                mask_directory,
+                self._workspace / "static_images",
+                preview_directory=preview_directory,
+                report_path=self._workspace / "final_background_report.json",
+                mode="refine",
+                progress_callback=lambda current, total: self.photo_progress.emit(
+                    current, total, "人工选区纹理补全与边界平滑",
+                ),
+                should_cancel=lambda: self._cancelled,
+            )
+            rounds = [completion]
+        else:
+            # Run a second forward/backward comparison only while more than
+            # 20% of the original boxed pixels remain black.  Round two uses
+            # the complete dataset produced by round one, so a background that
+            # became visible in one frame can support its neighbours.
+            rounds = []
+            round_source = source_directory
+            original_dynamic = 0
+            for round_number in (1, 2):
+                completion = complete_dynamic_backgrounds(
+                    database,
+                    round_source,
+                    mask_directory,
+                    self._workspace / "static_images",
+                    preview_directory=preview_directory,
+                    report_path=self._workspace /
+                    f"background_completion_report_round{round_number}.json",
+                    mode="multiview",
+                    progress_callback=lambda current, total, number=round_number:
+                    self.photo_progress.emit(
+                        current, total, f"第 {number} 轮跨帧拼接静态背景"
+                    ),
+                    should_cancel=lambda: self._cancelled,
+                )
+                rounds.append(completion)
+                if round_number == 1:
+                    original_dynamic = completion.dynamic_pixels
+                remaining_ratio = completion.unresolved_pixels / max(
+                    original_dynamic, 1
+                )
+                self.log_received.emit(
+                    f"第 {round_number} 轮拼接后，原始框选区域仍有 "
+                    f"{remaining_ratio * 100:.1f}% 未恢复。\n"
+                )
+                if self._cancelled or remaining_ratio <= 0.20:
+                    break
+                round_source = self._workspace / "static_images"
+            completion = rounds[-1]
+            shutil.copyfile(
+                completion.report_path,
+                self._workspace / "background_completion_report.json",
+            )
         if final:
             self.log_received.emit(
                 "人工选区补全与平滑："
@@ -816,13 +950,13 @@ class ColmapRunner(QObject):
                 f"弱纹理边界多数填充 {completion.small_hole_pixels}。\n"
             )
         else:
+            original_dynamic = rounds[0].dynamic_pixels
+            final_unresolved = rounds[-1].unresolved_pixels
+            total_completed = max(0, original_dynamic - final_unresolved)
             self.log_received.emit(
-                "首次跨帧背景拼接："
-                f"{completion.completed_images} 张照片获得可信拼接，"
-                f"补全 {completion.completed_pixels}/{completion.dynamic_pixels} 个动态像素，"
-                f"其中强纹理一致区域 {completion.strong_texture_pixels}，"
-                f"弱纹理几何一致区域 {completion.weak_texture_pixels}；"
-                f"其余 {completion.unresolved_pixels} 个像素留给人工复核。\n"
+                f"{len(rounds)} 轮跨帧背景拼接完成："
+                f"累计恢复 {total_completed}/{original_dynamic} 个框选像素；"
+                f"其余 {final_unresolved} 个像素保留原框并进入人工复核。\n"
             )
 
     def _process_error(self, error) -> None:
