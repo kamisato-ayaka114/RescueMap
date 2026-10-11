@@ -38,7 +38,7 @@ def _image_paths(directory: Path) -> list[Path]:
     )
 
 
-def _blur_mask(rgb: np.ndarray, max_dimension: int = 1100) -> np.ndarray:
+def _blur_mask(rgb: np.ndarray, max_dimension: int = 800) -> np.ndarray:
     """Find areas whose detail is weak although their neighbourhood is sharp."""
     height, width = rgb.shape[:2]
     scale = min(1.0, max_dimension / max(height, width))
@@ -118,7 +118,7 @@ def detect_blurry_regions(
             "selected_pixels": selected_pixels,
         },
     }, ensure_ascii=False, indent=2), encoding="utf-8")
-    return ClaritySummary(len(paths), selected_images, selected_pixels)
+    return ClaritySummary(len(records), selected_images, selected_pixels)
 
 
 def _weak_texture_clarity(rgb: np.ndarray, region: np.ndarray) -> np.ndarray:

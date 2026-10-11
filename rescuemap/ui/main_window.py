@@ -503,6 +503,8 @@ class MainWindow(QMainWindow):
             "分析跨帧几何并生成动态掩膜",
             "多视角恢复静态背景",
             "生成最终静态图片数据集",
+            "自动检测最终数据集模糊区域",
+            "自适应清晰化所选区域",
         }:
             self._show_processing_wait_dialog(title)
 
