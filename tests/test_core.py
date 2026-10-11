@@ -23,6 +23,10 @@ from rescuemap.core.background_completion import (
     _texture_adaptive_boundary_fill,
 )
 from rescuemap.core.colmap_runner import ColmapRunner, build_colmap_stages
+from rescuemap.core.clarity_enhancement import (
+    _blur_mask,
+    clarify_selected_regions,
+)
 from rescuemap.core.candidate_validation import (
     ColmapCamera,
     ColmapImage,
@@ -54,6 +58,45 @@ from rescuemap.core.terrain_mesh import build_terrain_mesh
 
 
 class DynamicSuppressionTests(unittest.TestCase):
+    def test_blur_detector_finds_flat_patch_inside_textured_surroundings(self):
+        height, width = 180, 260
+        yy, xx = np.indices((height, width))
+        texture = 120 + 35 * np.sin(xx / 2.7) + 20 * np.sin((xx + yy) / 4.3)
+        rgb = np.repeat(np.clip(texture, 0, 255)[:, :, None], 3, axis=2).astype(np.uint8)
+        rgb[60:125, 85:180] = 120
+
+        detected = _blur_mask(rgb)
+
+        self.assertGreater(int(detected[60:125, 85:180].sum()), 200)
+        self.assertEqual(int(detected[:35].sum()), 0)
+
+    def test_clarity_pass_preserves_backup_and_processes_reviewed_mask(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
+            root = Path(temporary_directory)
+            images = root / "static_images"
+            masks = root / "clarity_masks"
+            backup = root / "static_images_before_clarity"
+            images.mkdir(); masks.mkdir()
+            height, width = 80, 120
+            yy, xx = np.indices((height, width))
+            texture = 110 + 30 * np.sin((xx + yy * 0.25) / 3.0)
+            rgb = np.repeat(np.clip(texture, 0, 255)[:, :, None], 3, axis=2).astype(np.uint8)
+            rgb[25:58, 40:82] = 110
+            Image.fromarray(rgb).save(images / "frame.png")
+            mask = np.full((height, width), 255, dtype=np.uint8)
+            mask[25:58, 40:82] = 0
+            Image.fromarray(mask).save(masks / "frame.png.png")
+
+            summary = clarify_selected_regions(
+                images, masks, backup, root / "clarity_report.json"
+            )
+
+            self.assertTrue((backup / "frame.png").is_file())
+            self.assertEqual(summary.selected_images, 1)
+            self.assertEqual(summary.selected_pixels, 33 * 42)
+            clarified = np.asarray(Image.open(images / "frame.png"))
+            self.assertGreater(float(clarified[25:58, 40:82].std()), 0.5)
+
     def test_saved_annotation_boxes_restore_an_older_workspace(self):
         with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
             workspace = Path(temporary_directory)
@@ -392,14 +435,17 @@ class CandidateValidationTests(unittest.TestCase):
                 True,
             )
 
-            self.assertEqual(len(stages), 16)
+            self.assertEqual(len(stages), 19)
             self.assertEqual(stages[3].kind, "generate_masks")
             self.assertEqual(stages[4].kind, "review_initial")
             self.assertEqual(stages[5].kind, "complete_backgrounds")
             self.assertEqual(stages[6].kind, "review_completed")
             self.assertEqual(stages[7].kind, "complete_final")
-            self.assertEqual(stages[8].kind, "review_final_static")
-            formal_feature = stages[9]
+            self.assertEqual(stages[8].kind, "detect_blur")
+            self.assertEqual(stages[9].kind, "review_clarity")
+            self.assertEqual(stages[10].kind, "clarify_final")
+            self.assertEqual(stages[11].kind, "review_final_static")
+            formal_feature = stages[12]
             self.assertIn("--ImageReader.mask_path", formal_feature.arguments)
             self.assertIn(str(workspace / "static_images"), formal_feature.arguments)
 

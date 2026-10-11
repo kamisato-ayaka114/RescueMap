@@ -12,6 +12,10 @@ from PIL import Image
 from PySide6.QtCore import QObject, QProcess, QThread, QTimer, Signal, Slot
 
 from rescuemap.core.background_completion import complete_dynamic_backgrounds
+from rescuemap.core.clarity_enhancement import (
+    clarify_selected_regions,
+    detect_blurry_regions,
+)
 from rescuemap.core.dynamic_mask import generate_geometry_masks
 from rescuemap.core.image_preprocess import enhance_low_light_dataset
 
@@ -201,6 +205,9 @@ def build_colmap_stages(
             _Stage("多视角恢复静态背景", "", (), "complete_backgrounds"),
             _Stage("人工复核恢复后的静态图片", "", (), "review_completed"),
             _Stage("生成最终静态图片数据集", "", (), "complete_final"),
+            _Stage("自动检测最终数据集模糊区域", "", (), "detect_blur"),
+            _Stage("人工复核待清晰化区域", "", (), "review_clarity"),
+            _Stage("自适应清晰化所选区域", "", (), "clarify_final"),
             _Stage("确认最终静态图片数据集", "", (), "review_final_static"),
         ]
 
@@ -423,7 +430,8 @@ class ColmapRunner(QObject):
             raise ValueError(f"未知的继续步骤：{start_kind}")
         if start_kind != "generate_masks" and not (workspace / "dynamic_masks").is_dir():
             raise FileNotFoundError("该工程尚未生成 dynamic_masks，不能从所选步骤继续。")
-        if start_kind in {"review_completed", "complete_final", "review_final_static"} \
+        if start_kind in {"review_completed", "complete_final", "detect_blur",
+                           "review_clarity", "clarify_final", "review_final_static"} \
                 and not (workspace / "static_images").is_dir():
             raise FileNotFoundError("该工程尚未生成 static_images，不能从所选步骤继续。")
         if start_kind in {"generate_masks", "complete_backgrounds", "complete_final"} \
@@ -456,6 +464,14 @@ class ColmapRunner(QObject):
                 workspace / "review_completed_annotations.json",
                 workspace / "refinement_masks",
             )
+        if start_kind in {"review_clarity", "clarify_final"} \
+                and not (workspace / "clarity_masks").is_dir() \
+                and (workspace / "review_clarity_annotations.json").is_file():
+            self._restore_annotation_boxes(
+                workspace / "static_images",
+                workspace / "review_clarity_annotations.json",
+                workspace / "clarity_masks",
+            )
 
         self._workspace = workspace
         self._image_directory = image_directory
@@ -467,7 +483,8 @@ class ColmapRunner(QObject):
         self._active = True
         self._preprocess_only = True
         self._resume_from_static = (
-            start_kind in {"review_completed", "complete_final", "review_final_static"}
+            start_kind in {"review_completed", "complete_final", "detect_blur",
+                           "review_clarity", "clarify_final", "review_final_static"}
             and (workspace / "static_images").is_dir()
         )
         self.log_received.emit(
@@ -553,6 +570,24 @@ class ColmapRunner(QObject):
             )
         QTimer.singleShot(0, self._start_next_stage)
 
+    def resume_after_clarity_review(self, choice: str) -> None:
+        """Apply reviewed clarity boxes, skip them, or cancel preprocessing."""
+        if not self._active:
+            return
+        if choice == "cancel":
+            self.cancel()
+            return
+        if choice == "skip":
+            clarify_index = next(
+                index for index, stage in enumerate(self._stages)
+                if stage.kind == "clarify_final"
+            )
+            self._stage_index = clarify_index
+            self.log_received.emit("已跳过最终数据集清晰化，直接进入最终确认。\n")
+        else:
+            self.log_received.emit("清晰化选区已保存，开始自适应处理。\n")
+        QTimer.singleShot(0, self._start_next_stage)
+
     def _switch_processing_images(self, directory: Path) -> None:
         assert self._processing_image_directory is not None
         old = str(self._processing_image_directory)
@@ -594,20 +629,31 @@ class ColmapRunner(QObject):
                 str(self._image_directory), str(self._workspace / "enhanced_images")
             )
             return
-        if stage.kind in {"review_initial", "review_completed"}:
+        if stage.kind in {"review_initial", "review_completed", "review_clarity"}:
             assert self._workspace is not None
             assert self._processing_image_directory is not None
             image_directory = (
                 self._processing_image_directory
-                if stage.kind == "review_initial"
-                else self._workspace / "static_images"
+                if stage.kind == "review_initial" else self._workspace / "static_images"
             )
             mask_directory = self._workspace / "dynamic_masks"
             if stage.kind == "review_completed":
                 mask_directory = self._workspace / "refinement_masks"
                 self._prepare_refinement_masks(image_directory, mask_directory)
+            elif stage.kind == "review_clarity":
+                mask_directory = self._workspace / "clarity_masks"
             self.review_requested.emit(
                 stage.kind, str(image_directory), str(mask_directory)
+            )
+            return
+        if stage.kind == "detect_blur":
+            self._start_python_stage(
+                self._detect_final_blur, "最终数据集模糊区域检测失败"
+            )
+            return
+        if stage.kind == "clarify_final":
+            self._start_python_stage(
+                self._clarify_final_dataset, "最终数据集清晰化失败"
             )
             return
         if stage.kind == "review_final_static":
@@ -772,6 +818,40 @@ class ColmapRunner(QObject):
         self.log_received.emit(
             f"已增强 {summary.image_count} 张夜间照片；全部照片共用亮度区间 "
             f"{summary.low_percentile:.1f}～{summary.high_percentile:.1f}，原图未修改。\n"
+        )
+
+    def _detect_final_blur(self) -> None:
+        assert self._workspace is not None
+        summary = detect_blurry_regions(
+            self._workspace / "static_images",
+            self._workspace / "clarity_masks",
+            self._workspace / "clarity_detection_report.json",
+            progress_callback=lambda current, total: self.photo_progress.emit(
+                current, total, "自动检测相对周围明显模糊的区域"
+            ),
+            should_cancel=lambda: self._cancelled,
+        )
+        self.log_received.emit(
+            f"清晰度检测完成：{summary.selected_images}/{summary.image_count} 张照片"
+            f"包含候选模糊区域，共 {summary.selected_pixels} 个候选像素。\n"
+        )
+
+    def _clarify_final_dataset(self) -> None:
+        assert self._workspace is not None
+        summary = clarify_selected_regions(
+            self._workspace / "static_images",
+            self._workspace / "clarity_masks",
+            self._workspace / "static_images_before_clarity",
+            self._workspace / "clarity_enhancement_report.json",
+            progress_callback=lambda current, total: self.photo_progress.emit(
+                current, total, "强/弱纹理自适应清晰化"
+            ),
+            should_cancel=lambda: self._cancelled,
+        )
+        self.log_received.emit(
+            f"最终数据集清晰化完成：处理 {summary.selected_images} 张照片；"
+            f"强纹理延伸 {summary.strong_texture_pixels} 像素，"
+            f"弱纹理主色稳定 {summary.weak_texture_pixels} 像素。\n"
         )
 
     @staticmethod

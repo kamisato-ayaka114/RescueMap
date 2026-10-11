@@ -348,6 +348,8 @@ class MainWindow(QMainWindow):
         self.resume_stage_combo.addItem("从首次背景恢复开始", "complete_backgrounds")
         self.resume_stage_combo.addItem("从第二次人工复核静态图片开始", "review_completed")
         self.resume_stage_combo.addItem("从最终静态数据生成开始", "complete_final")
+        self.resume_stage_combo.addItem("从最终模糊区域自动检测开始", "detect_blur")
+        self.resume_stage_combo.addItem("从最终清晰化人工复核开始", "review_clarity")
         self.resume_stage_combo.addItem("只查看并确认最终静态数据集", "review_final_static")
         self.resume_preprocessing_button = QPushButton("从所选步骤继续")
         self.resume_preprocessing_button.clicked.connect(self.resume_preprocessing)
@@ -597,7 +599,9 @@ class MainWindow(QMainWindow):
             f"最终图片：{result.static_images}\n"
             f"动态掩膜：{result.masks}\n"
             f"第一次带框图片：{result.workspace / 'manual_review_initial'}\n"
-            f"第二次带框图片：{result.workspace / 'manual_review_final'}",
+            f"第二次带框图片：{result.workspace / 'manual_review_final'}\n"
+            f"清晰化带框图片：{result.workspace / 'manual_review_clarity'}\n"
+            f"清晰化前备份：{result.workspace / 'static_images_before_clarity'}",
         )
 
     def _view_last_static_dataset(self) -> None:
@@ -624,14 +628,23 @@ class MainWindow(QMainWindow):
         title = (
             "第一次复核：修正自动检测的动态区域"
             if phase == "review_initial"
-            else "第二次复核：检查恢复后的静态图片"
+            else (
+                "最终清晰化复核：修正自动检测的模糊区域"
+                if phase == "review_clarity"
+                else "第二次复核：检查恢复后的静态图片"
+            )
         )
         dialog = DynamicReviewDialog(
             Path(image_directory), Path(mask_directory), phase=phase,
             title=title, parent=self
         )
         accepted = dialog.exec() == dialog.DialogCode.Accepted
-        self.colmap_runner.resume_after_review(accepted)
+        if phase == "review_clarity":
+            self.colmap_runner.resume_after_clarity_review(
+                dialog.choice if accepted else "cancel"
+            )
+        else:
+            self.colmap_runner.resume_after_review(accepted)
 
     def _review_enhanced_dataset(self, original_directory: str, enhanced_directory: str) -> None:
         dialog = DatasetComparisonDialog(
@@ -655,7 +668,8 @@ class MainWindow(QMainWindow):
             alternative_text="返回继续框选补全/平滑区域",
             message_text=(
                 "逐张比较原图和当前静态数据集。若仍有黑洞、错误纹理或明显接缝，"
-                "请返回继续框选；已有选区会保留，可反复修复，直到你确认进入下一步。"
+                "请返回继续框选；之后还会重新自动检测模糊区域并允许人工增删清晰化框，"
+                "直到你确认进入下一步。"
             ),
             parent=self,
         )

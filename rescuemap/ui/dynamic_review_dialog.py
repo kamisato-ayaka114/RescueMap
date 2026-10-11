@@ -150,6 +150,7 @@ class DynamicReviewDialog(QDialog):
                             if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES)
         self.current_index = -1
         self.dirty = False
+        self.choice = "apply"
         self.setWindowTitle(title)
         self.resize(1020, 660)
 
@@ -160,8 +161,11 @@ class DynamicReviewDialog(QDialog):
         for index, path in enumerate(self.paths):
             relative = str(path.relative_to(self.image_directory)).replace("\\", "/")
             count = automatic.get(relative, 0)
-            if self.phase == "review_initial":
+            if self.phase in {"review_initial", "review_clarity"}:
+                noun = "模糊" if self.phase == "review_clarity" else "动态"
                 prefix = f"● 算法{count}处" if count > 0 else "○ 未检出"
+                if count > 0:
+                    prefix = f"● 算法{noun}{count}处"
             else:
                 mask_path = self.mask_directory / (relative + ".png")
                 selected = False
@@ -186,13 +190,20 @@ class DynamicReviewDialog(QDialog):
                 "左侧“未检出”只表示算法没有足够证据，仍需人工检查。切换图片时自动保存。\n"
                 "保存继续后，掩膜、带框图片和框坐标会留在本次工程中，下次可直接续跑。"
             )
-        else:
+        elif self.phase == "review_completed":
             help_text = (
                 "跨帧静态背景已最多拼接两轮：成功恢复的部分已自动移出红框，"
                 "仍为黑色或未恢复的第一轮标注会保留红框；你也可以继续补框。\n"
                 "左键拖框选择，右键单击红框删除；算法会根据四周边界纹理补全，"
                 "参考范围会越过框外少量像素，并在框内外接缝做高斯羽化。切换图片时自动保存。\n"
                 "处理后还会显示前后对照；不满意可返回本窗口继续增删框，直到人为确认。"
+            )
+        else:
+            help_text = (
+                f"算法已在 {detected_count}/{len(self.paths)} 张最终静态图片中标出相对周围明显模糊的区域。"
+                "红框仅是候选：左键拖框补充，右键单击框内删除，切换图片时自动保存。\n"
+                "应用后，强纹理包围区域会沿周围纹理方向恢复高频细节；弱纹理包围区域会使用"
+                "周围出现最多的颜色稳定低频结构，并只增强原本存在的微弱细节。也可以跳过此步骤。"
             )
         help_label = QLabel(help_text)
         help_label.setWordWrap(True)
@@ -203,12 +214,20 @@ class DynamicReviewDialog(QDialog):
         next_button.clicked.connect(lambda: self.list_widget.setCurrentRow(min(len(self.paths)-1, self.current_index + 1)))
         accept_button = QPushButton(
             "保存动态框并继续" if self.phase == "review_initial"
-            else "应用所选补全与平滑区域"
+            else (
+                "应用所选清晰化区域" if self.phase == "review_clarity"
+                else "应用所选补全与平滑区域"
+            )
         )
         cancel_button = QPushButton("取消本次重建")
         accept_button.clicked.connect(self._accept)
         cancel_button.clicked.connect(self.reject)
-        buttons = QHBoxLayout(); buttons.addWidget(previous_button); buttons.addWidget(next_button); buttons.addStretch(); buttons.addWidget(cancel_button); buttons.addWidget(accept_button)
+        buttons = QHBoxLayout(); buttons.addWidget(previous_button); buttons.addWidget(next_button); buttons.addStretch(); buttons.addWidget(cancel_button)
+        if self.phase == "review_clarity":
+            skip_button = QPushButton("跳过清晰化")
+            skip_button.clicked.connect(self._skip)
+            buttons.addWidget(skip_button)
+        buttons.addWidget(accept_button)
         right = QWidget(); right_layout = QVBoxLayout(right); right_layout.addWidget(help_label); right_layout.addWidget(self.canvas, 1); right_layout.addLayout(buttons)
         splitter = QSplitter(); splitter.addWidget(self.list_widget); splitter.addWidget(right); splitter.setStretchFactor(1, 1)
         layout = QVBoxLayout(self); layout.addWidget(splitter)
@@ -216,17 +235,28 @@ class DynamicReviewDialog(QDialog):
             self.list_widget.setCurrentRow(first_detected if first_detected >= 0 else 0)
 
     def _automatic_detection_counts(self) -> dict[str, int]:
-        if self.phase != "review_initial":
+        if self.phase not in {"review_initial", "review_clarity"}:
             return {}
-        report_path = self.mask_directory.parent / "dynamic_report.json"
+        report_path = self.mask_directory.parent / (
+            "clarity_detection_report.json"
+            if self.phase == "review_clarity" else "dynamic_report.json"
+        )
         if not report_path.is_file():
             return {}
         try:
             report = json.loads(report_path.read_text(encoding="utf-8"))
+            count_key = (
+                "blur_regions" if self.phase == "review_clarity"
+                else "dynamic_feature_clusters"
+            )
+            pixel_key = (
+                "selected_pixels" if self.phase == "review_clarity"
+                else "masked_pixels"
+            )
             return {
-                str(item["image"]).replace("\\", "/"): int(item.get("dynamic_feature_clusters", 0))
+                str(item["image"]).replace("\\", "/"): int(item.get(count_key, 0))
                 for item in report.get("images", [])
-                if int(item.get("masked_pixels", 0)) > 0
+                if int(item.get(pixel_key, 0)) > 0
             }
         except (OSError, ValueError, TypeError, KeyError):
             return {}
@@ -265,15 +295,24 @@ class DynamicReviewDialog(QDialog):
     def _accept(self) -> None:
         self._save_current()
         self._export_boxed_dataset()
+        self.choice = "apply"
+        self.accept()
+
+    def _skip(self) -> None:
+        self._save_current()
+        self._export_boxed_dataset()
+        self.choice = "skip"
         self.accept()
 
     def _export_boxed_dataset(self) -> None:
         """Save reproducible annotations and red-box previews separate from inputs."""
         workspace = self.mask_directory.parent
-        preview_directory = workspace / (
-            "manual_review_initial" if self.phase == "review_initial"
-            else "manual_review_final"
-        )
+        preview_name = {
+            "review_initial": "manual_review_initial",
+            "review_completed": "manual_review_final",
+            "review_clarity": "manual_review_clarity",
+        }.get(self.phase, "manual_review")
+        preview_directory = workspace / preview_name
         preview_directory.mkdir(parents=True, exist_ok=True)
         records = []
         for image_path in self.paths:
