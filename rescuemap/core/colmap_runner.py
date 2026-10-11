@@ -434,7 +434,8 @@ class ColmapRunner(QObject):
                            "review_clarity", "clarify_final", "review_final_static"} \
                 and not (workspace / "static_images").is_dir():
             raise FileNotFoundError("该工程尚未生成 static_images，不能从所选步骤继续。")
-        if start_kind in {"generate_masks", "complete_backgrounds", "complete_final"} \
+        if start_kind in {"generate_masks", "complete_backgrounds", "complete_final",
+                           "review_clarity", "clarify_final"} \
                 and not (workspace / "dynamic_preview" / "database.db").is_file():
             raise FileNotFoundError("该工程缺少快速重建数据库，无法继续自动处理。")
 
@@ -838,10 +839,34 @@ class ColmapRunner(QObject):
 
     def _clarify_final_dataset(self) -> None:
         assert self._workspace is not None
-        summary = clarify_selected_regions(
-            self._workspace / "static_images",
+        static_images = self._workspace / "static_images"
+        backup = self._workspace / "static_images_before_clarity"
+        if not backup.exists():
+            shutil.copytree(static_images, backup)
+        # Prefer real evidence from registered neighbouring frames.  Pixels
+        # accepted here are removed from clarity_masks; only the unresolved
+        # remainder falls back to local strong/weak texture synthesis below.
+        multiview = complete_dynamic_backgrounds(
+            self._workspace / "dynamic_preview" / "database.db",
+            static_images,
             self._workspace / "clarity_masks",
-            self._workspace / "static_images_before_clarity",
+            static_images,
+            preview_directory=self._workspace / "clarity_multiview_previews",
+            report_path=self._workspace / "clarity_multiview_report.json",
+            mode="multiview",
+            progress_callback=lambda current, total: self.photo_progress.emit(
+                current, total, "前后帧一致性清晰化"
+            ),
+            should_cancel=lambda: self._cancelled,
+        )
+        self.log_received.emit(
+            f"前后帧清晰化先恢复 {multiview.completed_pixels} 个可靠像素；"
+            f"其余 {multiview.unresolved_pixels} 个像素再使用局部纹理。\n"
+        )
+        summary = clarify_selected_regions(
+            static_images,
+            self._workspace / "clarity_masks",
+            backup,
             self._workspace / "clarity_enhancement_report.json",
             progress_callback=lambda current, total: self.photo_progress.emit(
                 current, total, "强/弱纹理自适应清晰化"

@@ -53,14 +53,16 @@ def _blur_mask(rgb: np.ndarray, max_dimension: int = 800) -> np.ndarray:
     high_frequency = np.abs(gray - gaussian_filter(gray, sigma=1.15, mode="nearest"))
     detail = gaussian_filter(high_frequency, sigma=2.4, mode="nearest")
     context = gaussian_filter(detail, sigma=16.0, mode="nearest")
-    floor = max(0.8, float(np.percentile(context, 58)) * 0.65)
-    candidate = (context >= floor) & (detail < context * 0.48)
+    # Deliberately conservative: only a substantial detail deficit relative
+    # to a clearly textured neighbourhood becomes an automatic red box.
+    floor = max(1.15, float(np.percentile(context, 65)) * 0.82)
+    candidate = (context >= floor) & (detail < context * 0.35)
     candidate = binary_opening(candidate, iterations=1)
     candidate = binary_closing(candidate, iterations=3)
 
     labels, count = label(candidate)
     retained = np.zeros_like(candidate)
-    minimum = max(20, int(candidate.size * 0.00018))
+    minimum = max(40, int(candidate.size * 0.00050))
     maximum = max(minimum + 1, int(candidate.size * 0.18))
     for component_id in range(1, count + 1):
         component = labels == component_id

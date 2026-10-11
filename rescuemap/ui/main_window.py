@@ -74,6 +74,7 @@ from rescuemap.core.terrain import (
     build_terrain_grid,
 )
 from rescuemap.core.terrain_mesh import build_terrain_mesh
+from rescuemap.core.weak_texture_cloud import complete_weak_texture_cloud
 from rescuemap.ui.dynamic_review_dialog import (
     DatasetComparisonDialog,
     DynamicReviewDialog,
@@ -128,6 +129,7 @@ class MainWindow(QMainWindow):
         self.route_end_point: np.ndarray | None = None
         self.route_result: RouteResult | None = None
         self.context_mesh: SceneModel | None = None
+        self.completed_point_scene: SceneModel | None = None
         self.settings = QSettings("RescueMap", "RescueMap")
         self.active_pipeline: str | None = None
         self.last_preprocessing_result: PreprocessingResult | None = None
@@ -203,6 +205,7 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(reconstruction_group)
         side_layout.addWidget(info_group)
         side_layout.addWidget(self._build_full_map_group())
+        side_layout.addWidget(self._build_point_completion_group())
         side_layout.addWidget(self._build_calibration_group())
         side_layout.addWidget(self._build_prediction_group())
         side_layout.addWidget(self._build_mesh_group())
@@ -505,6 +508,7 @@ class MainWindow(QMainWindow):
             "生成最终静态图片数据集",
             "自动检测最终数据集模糊区域",
             "自适应清晰化所选区域",
+            "前后帧一致性清晰化",
         }:
             self._show_processing_wait_dialog(title)
 
@@ -860,6 +864,32 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.full_map_summary_label)
         return group
 
+    def _build_point_completion_group(self) -> QGroupBox:
+        group = CollapsibleGroupBox("弱纹理点云预测补全（实验，点击标题折叠）")
+        layout = QVBoxLayout(group)
+        note = QLabel(
+            "根据已有点云在多视角中的投影空洞预测补充点；只填充被表面包围且深度连续的区域。"
+            "预测点与真实点分开标记，不会覆盖 fused.ply。"
+        )
+        note.setWordWrap(True)
+        generate_button = QPushButton("生成弱纹理预测点云")
+        generate_button.clicked.connect(self.generate_weak_texture_point_cloud)
+        self.show_completed_cloud_checkbox = QCheckBox("显示补全后点云（取消勾选查看补全前）")
+        self.show_completed_cloud_checkbox.setEnabled(False)
+        self.show_completed_cloud_checkbox.toggled.connect(self._show_scene)
+        self.highlight_predicted_checkbox = QCheckBox("用紫色突出显示预测点")
+        self.highlight_predicted_checkbox.setChecked(True)
+        self.highlight_predicted_checkbox.setEnabled(False)
+        self.highlight_predicted_checkbox.toggled.connect(self._show_scene)
+        self.point_completion_summary_label = QLabel("尚未生成预测点云")
+        self.point_completion_summary_label.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addWidget(generate_button)
+        layout.addWidget(self.show_completed_cloud_checkbox)
+        layout.addWidget(self.highlight_predicted_checkbox)
+        layout.addWidget(self.point_completion_summary_label)
+        return group
+
     def _build_calibration_group(self) -> QGroupBox:
         group = CollapsibleGroupBox("坐标与尺度校准（点击标题折叠）")
         layout = QVBoxLayout(group)
@@ -1119,7 +1149,7 @@ class MainWindow(QMainWindow):
         filename, _ = QFileDialog.getOpenFileName(
             self, "选择三维模型",
             "F:/Desktop/map_rescue/demo01/workspace1/dense/0",
-            "PLY 模型 (*.ply)",
+            "三维模型 (*.ply *.vtp);;PLY 模型 (*.ply);;VTP 模型 (*.vtp)",
         )
         if filename:
             self.load_model(Path(filename))
@@ -1131,6 +1161,11 @@ class MainWindow(QMainWindow):
         try:
             self.scene = SceneModel.load(path)
             self.context_mesh = None
+            self.completed_point_scene = None
+            self.show_completed_cloud_checkbox.setChecked(False)
+            self.show_completed_cloud_checkbox.setEnabled(False)
+            self.highlight_predicted_checkbox.setEnabled(False)
+            self.point_completion_summary_label.setText("尚未生成预测点云")
             self.show_source_checkbox.setChecked(True)
             self.show_full_map_checkbox.setChecked(False)
             self.show_full_map_checkbox.setEnabled(False)
@@ -1146,28 +1181,124 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
+    def generate_weak_texture_point_cloud(self) -> None:
+        if self.scene is None or not self.scene.is_point_cloud:
+            QMessageBox.information(
+                self, "尚无点云", "请先加载重建生成的 dense/fused.ply 点云。"
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "生成预测点云",
+            "该步骤不会修改原始 fused.ply。软件只补充在多个相机投影中被已有表面包围、"
+            "且邻域深度连续的空洞，并将其标为预测点。\n\n"
+            "预测结果仍需人工比较，不能视为真实测量。是否继续？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        dialog = QProgressDialog("正在建立投影关系……", "取消", 0, 12, self)
+        dialog.setWindowTitle("弱纹理点云预测")
+        dialog.setMinimumDuration(0)
+        dialog.setMinimumWidth(390)
+        dialog.setAutoClose(False)
+        dialog.show()
+
+        def update_progress(current: int, total: int) -> None:
+            dialog.setMaximum(total)
+            dialog.setValue(current)
+            dialog.setLabelText(
+                f"正在利用相机投影补充连续表面\n已完成 {current}/{total} 个视角"
+            )
+            QApplication.processEvents()
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = complete_weak_texture_cloud(
+                self.scene.path,
+                output_directory=self.scene.path.parent,
+                progress_callback=update_progress,
+                should_cancel=dialog.wasCanceled,
+            )
+            completed = SceneModel.load(result.combined_path)
+            completed.apply_transform(self.scene.calibration_matrix)
+            self.completed_point_scene = completed
+            self.show_completed_cloud_checkbox.setEnabled(True)
+            self.highlight_predicted_checkbox.setEnabled(True)
+            self.show_completed_cloud_checkbox.setChecked(True)
+            self.point_completion_summary_label.setText(
+                f"真实点：{result.original_points:,}\n"
+                f"预测补充点：{result.predicted_points:,}\n"
+                f"补全后：{result.combined_path.name}\n"
+                "取消勾选可立即查看补全前点云；紫色点均为预测数据。"
+            )
+            self._show_scene()
+            QMessageBox.information(
+                self,
+                "预测点云已生成",
+                "补全前后的点云均已保留。请切换“显示补全后点云”比较空洞，"
+                "并用紫色预测点检查是否存在跨越物体边界的错误补点。\n\n"
+                f"补全后：{result.combined_path}\n"
+                f"仅预测点：{result.predicted_path}\n"
+                f"报告：{result.report_path}",
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "点云预测未完成", str(exc))
+        finally:
+            dialog.close()
+            QApplication.restoreOverrideCursor()
+
     def _show_scene(self) -> None:
         self.plotter.disable_picking()
         self.plotter.clear()
         self.plotter.add_axes()
         self.plotter.show_grid(color="#66727d")
-        if self.scene is not None:
+        display_scene = (
+            self.completed_point_scene
+            if self.completed_point_scene is not None
+            and self.show_completed_cloud_checkbox.isChecked()
+            else self.scene
+        )
+        if display_scene is not None:
             kwargs: dict[str, object] = {}
-            if self.color_mode == "density" and "DensityRGB" in self.scene.display.point_data:
+            if self.color_mode == "density" and "DensityRGB" in display_scene.display.point_data:
                 kwargs.update(scalars="DensityRGB", rgb=True)
             else:
-                rgb_name = self.scene.rgb_array_name()
+                rgb_name = display_scene.rgb_array_name()
                 if rgb_name:
                     kwargs.update(scalars=rgb_name, rgb=True)
             if self.show_source_checkbox.isChecked():
-                if self.scene.is_point_cloud:
-                    self.plotter.add_mesh(
-                        self.scene.display, name="base-model", style="points",
-                        point_size=2, render_points_as_spheres=False, **kwargs,
+                if display_scene.is_point_cloud:
+                    source = display_scene.display.point_data.get("PointSource")
+                    highlight = (
+                        display_scene is self.completed_point_scene
+                        and self.highlight_predicted_checkbox.isChecked()
+                        and source is not None
                     )
+                    if highlight:
+                        source = np.asarray(source).reshape(-1)
+                        real = display_scene.display.extract_points(source == 0)
+                        predicted = display_scene.display.extract_points(source == 1)
+                        real_kwargs: dict[str, object] = {}
+                        rgb_name = display_scene.rgb_array_name()
+                        if rgb_name and rgb_name in real.point_data:
+                            real_kwargs.update(scalars=rgb_name, rgb=True)
+                        self.plotter.add_mesh(
+                            real, name="base-model", style="points", point_size=2,
+                            render_points_as_spheres=False, **real_kwargs,
+                        )
+                        self.plotter.add_mesh(
+                            predicted, name="predicted-cloud", style="points",
+                            color="#d946ef", point_size=4,
+                            render_points_as_spheres=True,
+                        )
+                    else:
+                        self.plotter.add_mesh(
+                            display_scene.display, name="base-model", style="points",
+                            point_size=2, render_points_as_spheres=False, **kwargs,
+                        )
                 else:
                     self.plotter.add_mesh(
-                        self.scene.display, name="base-model", smooth_shading=True,
+                        display_scene.display, name="base-model", smooth_shading=True,
                         show_edges=False, **kwargs,
                     )
         if (
@@ -1425,6 +1556,8 @@ class MainWindow(QMainWindow):
         self.scene.apply_transform(transform)
         if self.context_mesh is not None:
             self.context_mesh.apply_transform(transform)
+        if self.completed_point_scene is not None:
+            self.completed_point_scene.apply_transform(transform)
 
     def _finish_ground_calibration(self, points: np.ndarray) -> None:
         try:

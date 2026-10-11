@@ -55,10 +55,24 @@ from rescuemap.core.terrain import (
 from rescuemap.core.scene import SceneModel
 from rescuemap.core.path_planning import plan_safe_path
 from rescuemap.core.terrain_mesh import build_terrain_mesh
+from rescuemap.core.weak_texture_cloud import _save_cloud
 
 
 class DynamicSuppressionTests(unittest.TestCase):
-    def test_blur_detector_finds_flat_patch_inside_textured_surroundings(self):
+    def test_predicted_cloud_file_keeps_real_and_predicted_labels(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as temporary_directory:
+            target = Path(temporary_directory) / "combined.vtp"
+            points = np.array([[0, 0, 0], [1, 0, 0], [0.5, 0.5, 0]], dtype=float)
+            colours = np.array([[10, 20, 30], [40, 50, 60], [70, 80, 90]], dtype=np.uint8)
+            source = np.array([0, 0, 1], dtype=np.uint8)
+
+            _save_cloud(target, points, colours, source)
+
+            loaded = pv.read(target)
+            np.testing.assert_array_equal(loaded.point_data["PointSource"], source)
+            np.testing.assert_array_equal(loaded.point_data["RGB"], colours)
+
+    def test_blur_detector_does_not_mark_most_of_a_flat_patch_automatically(self):
         height, width = 180, 260
         yy, xx = np.indices((height, width))
         texture = 120 + 35 * np.sin(xx / 2.7) + 20 * np.sin((xx + yy) / 4.3)
@@ -67,7 +81,10 @@ class DynamicSuppressionTests(unittest.TestCase):
 
         detected = _blur_mask(rgb)
 
-        self.assertGreater(int(detected[60:125, 85:180].sum()), 200)
+        # Large ambiguous weak-texture areas require human confirmation; the
+        # stricter automatic pass must not box the entire patch merely because
+        # its surroundings are textured.
+        self.assertLess(float(detected[60:125, 85:180].mean()), 0.10)
         self.assertEqual(int(detected[:35].sum()), 0)
 
     def test_clarity_pass_preserves_backup_and_processes_reviewed_mask(self):

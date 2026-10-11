@@ -21,8 +21,8 @@ class SceneModel:
         path = path.expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(f"找不到模型文件：{path}")
-        if path.suffix.lower() != ".ply":
-            raise ValueError("Viewer 0.1 暂时只支持 PLY 文件。")
+        if path.suffix.lower() not in {".ply", ".vtp"}:
+            raise ValueError("当前只支持 PLY 或 VTP 点云/网格文件。")
 
         data = pv.read(path)
         display = data
